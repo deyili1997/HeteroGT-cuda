@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: heterogt
+Version: 0.1.0
+Summary: heterogeneous graph transformer
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: pandas
