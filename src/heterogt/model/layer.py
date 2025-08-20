@@ -91,51 +91,92 @@ class BinaryPredictionHead(nn.Module):
             )
     def forward(self, input):
         return self.cls(input)
-
-class TransformerEncoder(nn.Module):
-    def __init__(self, d_model, num_heads, num_layers, dropout=0.1, dim_feedforward=2048):
+    
+class HierTransformerLayer(nn.Module):
+    def __init__(self, d_model, num_heads, batch_first=True, norm_first=True):
         super().__init__()
-        self.layers = nn.ModuleList([
-            nn.ModuleDict({
-                "self_attn": nn.MultiheadAttention(
-                    embed_dim=d_model,
-                    num_heads=num_heads,
-                    batch_first=True
-                ),
-                "linear1": nn.Linear(d_model, dim_feedforward),
-                "linear2": nn.Linear(dim_feedforward, d_model),
-                "norm1": nn.LayerNorm(d_model),
-                "norm2": nn.LayerNorm(d_model),
-                "dropout": nn.Dropout(dropout),
-                "dropout1": nn.Dropout(dropout),  # 自注意力 Dropout
-                "dropout2": nn.Dropout(dropout)   # FFN Dropout
-            }) for _ in range(num_layers)
-        ])
-        self.dropout = nn.Dropout(dropout)
-        self.activation = F.relu  # 与 nn.TransformerEncoderLayer 默认一致
+        self.d_model = d_model
+        self.num_heads = num_heads
 
-    def forward(self, src, mask=None, src_key_padding_mask=None):
-        """
-        src: (B, S, D) - 批量大小, 序列长度, 嵌入维度
-        attn_mask: (B, S, S) 或 (S, S)
-        key_padding_mask: (B, S) True=mask掉
-        """
-        x = src
-        for layer in self.layers:
-            # === 自注意力 (Pre-LayerNorm) ===
-            residual = x
-            x = layer["norm1"](x)  # 先归一化
-            attn_output, _ = layer["self_attn"](
-                x, x, x,
-                attn_mask=mask,
-                key_padding_mask=src_key_padding_mask
-            )
-            x = residual + layer["dropout1"](attn_output)  # 残差连接 + Dropout
+        self.transformer_level_A = nn.TransformerEncoderLayer(
+            d_model, num_heads, batch_first=batch_first, norm_first=norm_first
+        )
+        self.transformer_level_B = nn.TransformerEncoderLayer(
+            d_model, num_heads, batch_first=batch_first, norm_first=norm_first
+        )
 
-            # === FFN (Pre-LayerNorm) ===
-            residual = x
-            x = layer["norm2"](x)  # 先归一化
-            x = layer["linear2"](self.activation(layer["linear1"](x)))
-            x = residual + layer["dropout2"](x)  # 残差连接 + Dropout
+    def forward(self, src, src_key_padding_mask, attn_mask_A, attn_mask_B):
+        """
+        src:                [B, L, d] (batch_first=True)
+        attn_mask_A/B:      [B*num_heads, L, L] 或 None；True=禁止，False=允许
+        src_key_padding_mask: [B, L]；True=PAD
+        """
+        B, L, _ = src.shape
+        H = self.num_heads
+        device = src.device
+
+        # ---- Phase A ----
+        yA = self.transformer_level_A(
+            src,
+            src_mask=attn_mask_A,                      # 注意参数名是 src_mask
+            src_key_padding_mask=src_key_padding_mask
+        )                                             # [B, L, d]
+
+        if attn_mask_A is not None and attn_mask_A.dim() == 3:
+            rows_A = self._rows_from_attn_mask(attn_mask_A, B, H)  # [B, L] True=应更新
+        else:
+            rows_A = torch.ones(B, L, dtype=torch.bool, device=device)
+
+        x = self._blend_update(src, yA, rows_A)      # 只写回允许的行
+
+        # ---- Phase B ----
+        yB = self.transformer_level_B(
+            x,
+            src_mask=attn_mask_B,
+            src_key_padding_mask=src_key_padding_mask
+        )
+
+        if attn_mask_B is not None and attn_mask_B.dim() == 3:
+            rows_B = self._rows_from_attn_mask(attn_mask_B, B, H)
+        else:
+            rows_B = torch.ones(B, L, dtype=torch.bool, device=device)
+
+        x = self._blend_update(x, yB, rows_B)
 
         return x
+
+    @staticmethod
+    def _blend_update(x_old: torch.Tensor, x_new: torch.Tensor, update_rows: torch.BoolTensor):
+        """
+        只在 update_rows=True 的行用 x_new 覆盖；其余行保留 x_old
+        x_old, x_new: [B, L, d]
+        update_rows:  [B, L] (True=更新)
+        """
+        mask = update_rows.unsqueeze(-1)              # [B, L, 1]
+        return torch.where(mask, x_new, x_old)
+
+    @staticmethod
+    def _rows_from_attn_mask(attn_mask: torch.Tensor, B: int, H: int):
+        """
+        从 [B*H, L, L] 的 attn_mask 推断“允许作为 Query 的行”（即该行存在至少1个非自身的未屏蔽列）。
+        返回 [B, L] 的 bool：True 表示该行会被本次前向更新（据此回写）。
+        约定：attn_mask==True 为“禁止”，False 为“允许”。
+        """
+        BH, L, _ = attn_mask.shape
+        assert BH == B * H, f"attn_mask 第一维应为 B*num_heads, got {BH} vs {B}*{H}"
+        m = attn_mask.view(B, H, L, L)  # [B, H, L, L]
+        
+        # 创建对角线掩码，忽略对角线的影响
+        diag_mask = torch.eye(L, dtype=torch.bool, device=attn_mask.device)  # [L, L]
+        diag_mask = diag_mask.unsqueeze(0).unsqueeze(0).expand(B, H, L, L)  # [B, H, L, L]
+        
+        # 将对角线位置设置为 True（屏蔽），以检查非对角线的 False
+        m_non_diag = m | diag_mask  # [B, H, L, L]
+        
+        # 检查每行（Query）是否全屏蔽（忽略对角线）
+        row_all_banned = m_non_diag.all(dim=-1)  # [B, H, L]
+        
+        # 如果某行在任一 head 中有非自身的未屏蔽列，则需要更新
+        row_updatable = (~row_all_banned).any(dim=1)  # [B, L]
+        
+        return row_updatable
