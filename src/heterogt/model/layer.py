@@ -105,11 +105,15 @@ class HierTransformerLayer(nn.Module):
             d_model, num_heads, batch_first=batch_first, norm_first=norm_first
         )
 
+        self.transformer_level_C = nn.TransformerEncoderLayer(
+            d_model, num_heads, batch_first=batch_first, norm_first=norm_first
+        )
+
     def forward(self, src, src_key_padding_mask, attn_mask_A, attn_mask_B):
         """
         src:                [B, L, d] (batch_first=True)
-        attn_mask_A/B:      [B*num_heads, L, L] 或 None；True=禁止，False=允许
-        src_key_padding_mask: [B, L]；True=PAD
+        attn_mask_A/B:      [B*num_heads, L, L] 或 None; True=禁止, False=允许
+        src_key_padding_mask: [B, L]; True=PAD
         """
         B, L, _ = src.shape
         H = self.num_heads
@@ -123,7 +127,7 @@ class HierTransformerLayer(nn.Module):
         )                                             # [B, L, d]
 
         if attn_mask_A is not None and attn_mask_A.dim() == 3:
-            rows_A = self._rows_from_attn_mask(attn_mask_A, B, H)  # [B, L] True=应更新
+            rows_A = self._rows_from_attn_mask(attn_mask_A, src_key_padding_mask, B, H)  # [B, L] True=应更新
         else:
             rows_A = torch.ones(B, L, dtype=torch.bool, device=device)
 
@@ -137,11 +141,18 @@ class HierTransformerLayer(nn.Module):
         )
 
         if attn_mask_B is not None and attn_mask_B.dim() == 3:
-            rows_B = self._rows_from_attn_mask(attn_mask_B, B, H)
+            rows_B = self._rows_from_attn_mask(attn_mask_B, src_key_padding_mask, B, H)
         else:
             rows_B = torch.ones(B, L, dtype=torch.bool, device=device)
 
         x = self._blend_update(x, yB, rows_B)
+
+        # ---- Phase C ----
+        x = self.transformer_level_C(
+            x,
+            src_mask=None,
+            src_key_padding_mask=src_key_padding_mask
+        )
 
         return x
 
@@ -156,27 +167,47 @@ class HierTransformerLayer(nn.Module):
         return torch.where(mask, x_new, x_old)
 
     @staticmethod
-    def _rows_from_attn_mask(attn_mask: torch.Tensor, B: int, H: int):
+    def _rows_from_attn_mask(attn_mask: torch.Tensor, src_key_padding_mask: torch.Tensor, B: int, H: int):
         """
-        从 [B*H, L, L] 的 attn_mask 推断“允许作为 Query 的行”（即该行存在至少1个非自身的未屏蔽列）。
-        返回 [B, L] 的 bool：True 表示该行会被本次前向更新（据此回写）。
-        约定：attn_mask==True 为“禁止”，False 为“允许”。
+        从 [B*H, L, L] 的 attn_mask 推断“允许作为 Query 的行”(即该行存在至少1个非自身的未屏蔽列, 
+        且该行不是填充 token)。返回 [B, L] 的 bool: True 表示该行会被本次前向更新。
+        约定:attn_mask==True 为“禁止”, False 为“允许”, src_key_padding_mask==True 为填充 token。
+        
+        参数：
+            attn_mask: [B*H, L, L], torch.bool, 注意力掩码
+            src_key_padding_mask: [B, L], torch.bool, 填充掩码, True 表示填充
+            B: batch_size
+            H: num_heads
+        返回：
+            row_updatable: [B, L], torch.bool, True 表示该 token 需要更新
         """
         BH, L, _ = attn_mask.shape
         assert BH == B * H, f"attn_mask 第一维应为 B*num_heads, got {BH} vs {B}*{H}"
+        assert src_key_padding_mask.shape == (B, L), \
+            f"src_key_padding_mask 形状应为 [B, L], got {src_key_padding_mask.shape}"
+        assert src_key_padding_mask.dtype == torch.bool, "src_key_padding_mask 必须是 torch.bool 类型"
+        assert src_key_padding_mask.device == attn_mask.device, \
+            f"设备不匹配: src_key_padding_mask 在 {src_key_padding_mask.device}, attn_mask 在 {attn_mask.device}"
+
         m = attn_mask.view(B, H, L, L)  # [B, H, L, L]
         
         # 创建对角线掩码，忽略对角线的影响
         diag_mask = torch.eye(L, dtype=torch.bool, device=attn_mask.device)  # [L, L]
         diag_mask = diag_mask.unsqueeze(0).unsqueeze(0).expand(B, H, L, L)  # [B, H, L, L]
         
-        # 将对角线位置设置为 True（屏蔽），以检查非对角线的 False
+        # 将对角线位置设置为 True（屏蔽），以检查非对角线的 False，因为我们原来对角线最后设置的是False
         m_non_diag = m | diag_mask  # [B, H, L, L]
         
-        # 检查每行（Query）是否全屏蔽（忽略对角线）
+        # 考虑 src_key_padding_mask，屏蔽填充 token 对应的 Key 位置
+        padding_mask = src_key_padding_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, L, 1]
+        m_non_diag = m_non_diag | padding_mask  # [B, H, L, L]，填充 token 的列全为 True（屏蔽）
+
+        # 检查每行（Query）是否全屏蔽（忽略对角线和填充 token）
         row_all_banned = m_non_diag.all(dim=-1)  # [B, H, L]
         
-        # 如果某行在任一 head 中有非自身的未屏蔽列，则需要更新
+        # 如果某行在任一 head 中有非自身的未屏蔽列（非填充 token），则需要更新
         row_updatable = (~row_all_banned).any(dim=1)  # [B, L]
         
+        # 排除填充 token：填充 token (src_key_padding_mask == True) 不应更新
+        row_updatable = row_updatable & (~src_key_padding_mask)  # [B, L]
         return row_updatable

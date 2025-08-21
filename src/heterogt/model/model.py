@@ -20,10 +20,11 @@ class HeteroGT(nn.Module):
         self.age_pad_id = tokenizer.convert_tokens_to_ids(["[PAD]"], voc_type="all")[0] #0
         self.node_type_id_dict = {'diag': 1, 'med': 2, 'lab': 3, 'pro': 4, 'group': 5, 'visit': 6}
         self.graph_node_types = ['diag']
-        self.forbid_map_A = {-1: [5, 6], 1: [5, 6], 2: [5, 6], 3: [5, 6], 4: [5, 6], 
+        self.forbid_map_A = {-1: [5, 6], 1: [5, 6], 2: [5, 6], 3: [5, 6], 4: [5, 6],
                            5: [-1, 1, 2, 3, 4, 5, 6], 6: [-1, 1, 2, 3, 4, 5, 6]}  # attention forbid mask, -1 is for the task token
-        self.forbid_map_B = {-1: [-1, 1, 2, 3, 4, 5, 6], 1: [-1, 1, 2, 3, 4, 5, 6], 2: [-1, 1, 2, 3, 4, 5, 6], 3: [-1, 1, 2, 3, 4, 5, 6],
-                             4: [-1, 1, 2, 3, 4, 5, 6], 5: [-1, 1, 2, 3, 4, 5, 6], 6: [-1, 1, 2, 3, 4, 5, 6]}
+        self.forbid_map_B = {-1: [1, 2, 3, 4], 1: [-1, 1, 2, 3, 4, 5, 6], 2: [-1, 1, 2, 3, 4, 5, 6], 3: [-1, 1, 2, 3, 4, 5, 6],
+                             4: [-1, 1, 2, 3, 4, 5, 6], 5: [1, 2, 3, 4, 5, 6], 6: [1, 5, 6]}
+
 
         # embedding layers
         self.token_emb = nn.Embedding(self.global_vocab_size, d_model, padding_idx=self.seq_pad_id) # already contains [PAD], will also be used for age_gender
@@ -125,7 +126,7 @@ class HeteroGT(nn.Module):
         Returns:
             A heterogeneous graph for patient p.
         """
-        # Temporal!!! trim off group code.
+        # trim off group code.
         seq_embed_p = seq_embed_p[token_types_p != self.node_type_id_dict['group'], :]
         adm_index_p = adm_index_p[token_types_p != self.node_type_id_dict['group']]
         token_types_p = token_types_p[token_types_p != self.node_type_id_dict['group']]
@@ -258,15 +259,29 @@ class HeteroGT(nn.Module):
         src_key_padding_mask = torch.cat([task_pad_mask, seq_pad_mask, visit_pad_mask], dim=1)  # [B, 1+L+V]
         token_types_w_task = torch.cat([torch.full((B, 1), -1, device=self.device), token_types], dim=1) # [B, 1+L+V]
         assert (src_key_padding_mask == (token_types_w_task == self.type_pad_id)).all(), "src_key_padding_mask and token_types_w_task pad positions do not match"
-        diag_code_group_dicts_w_task = [{k + 1: [v_i + 1 for v_i in v] for k, v in d.items()} for d in diag_code_group_dicts]
+        # build attn mask A
         attn_mask_A = self.build_attn_mask(token_types_w_task, 
                                          forbid_map=self.forbid_map_A, 
                                          num_heads=self.num_attn_heads,
                                          allow_attn_dicts=None)
+        # build attn mask B
+        diag_code_group_dicts_w_task = [{k + 1: [v_i + 1 for v_i in v] for k, v in d.items()} for d in diag_code_group_dicts]
+        # sanity check before building attn mask B
+        for i, d in enumerate(diag_code_group_dicts_w_task):
+            if not d:
+                continue
+            keys = torch.as_tensor(list(d.keys()), device=token_types_w_task.device)
+            vals = torch.as_tensor([v for vs in d.values() for v in vs], device=token_types_w_task.device)
+
+            assert (token_types_w_task[i, keys] == self.node_type_id_dict['group']).all(), f"keys check fail at {i}"
+            assert (token_types_w_task[i, vals] == self.node_type_id_dict['diag']).all(), f"values check fail at {i}"
+        
+        # build attn mask B
         attn_mask_B = self.build_attn_mask(token_types_w_task,
                                          forbid_map=self.forbid_map_B,
                                          num_heads=self.num_attn_heads,
                                          allow_attn_dicts=diag_code_group_dicts_w_task)
+        
         assert attn_mask_A.dtype == src_key_padding_mask.dtype, f"attn_mask dtype ({attn_mask_A.dtype}) and src_key_padding_mask dtype ({src_key_padding_mask.dtype}) must match"
         return x, src_key_padding_mask, attn_mask_A, attn_mask_B
 
