@@ -20,11 +20,13 @@ class HeteroGT(nn.Module):
         self.age_pad_id = tokenizer.convert_tokens_to_ids(["[PAD]"], voc_type="all")[0] #0
         self.node_type_id_dict = {'diag': 1, 'med': 2, 'lab': 3, 'pro': 4, 'group': 5, 'visit': 6}
         self.graph_node_types = ['diag']
-        self.forbid_map_A = {-1: [5, 6], 1: [5, 6], 2: [5, 6], 3: [5, 6], 4: [5, 6],
-                           5: [-1, 1, 2, 3, 4, 5, 6], 6: [-1, 1, 2, 3, 4, 5, 6]}  # attention forbid mask, -1 is for the task token
-        self.forbid_map_B = {-1: [1, 2, 3, 4], 1: [-1, 1, 2, 3, 4, 5, 6], 2: [-1, 1, 2, 3, 4, 5, 6], 3: [-1, 1, 2, 3, 4, 5, 6],
-                             4: [-1, 1, 2, 3, 4, 5, 6], 5: [1, 2, 3, 4, 5, 6], 6: [1, 5, 6]}
-
+        # PUT VISIT INTO CONTEXT OF 2, 3, 4 IS BAD!
+        self.forbid_map_A = {-1: [5, 6], 
+                             1: [5, 6], 2: [5, 6], 3: [5, 6], 4: [5, 6],
+                             5: [-1, 1, 2, 3, 4, 5, 6], 6: [-1, 1, 2, 3, 4, 5, 6]}  # attention forbid mask, -1 is for the task token
+        self.forbid_map_B = {-1: [-1, 1, 2, 3, 4, 5, 6], 
+                             1: [-1, 1, 2, 3, 4, 5, 6], 2: [-1, 1, 2, 3, 4, 5, 6], 3: [-1, 1, 2, 3, 4, 5, 6], 4: [-1, 1, 2, 3, 4, 5, 6],
+                             5: [1, 2, 3, 4, 5, 6], 6: [-1, 1, 2, 3, 4, 5, 6]}  # attention forbid mask, -1 is for the task token
 
         # embedding layers
         self.token_emb = nn.Embedding(self.global_vocab_size, d_model, padding_idx=self.seq_pad_id) # already contains [PAD], will also be used for age_gender
