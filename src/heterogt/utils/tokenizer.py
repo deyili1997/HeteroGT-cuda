@@ -16,7 +16,8 @@ class Voc(object):
 class EHRTokenizer(object):
     def __init__(self, age_sentences, group_code_sentences, diag_sentences, med_sentences, lab_sentences, 
                  pro_sentences, special_tokens):
-        self.vocab = Voc() # this is the global vocabulary, not including age, token type, adm_index and task
+        # this is the global vocabulary, including special tokens (pad and cls), age, group_code, diag, med, lab, pro
+        self.vocab = Voc() 
 
         # Add special tokens to the global voc table. 
         # Note that the PAD is 0.

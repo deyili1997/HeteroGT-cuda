@@ -97,63 +97,19 @@ class HierTransformerLayer(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
+        self.transformer = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=batch_first, norm_first=norm_first)
 
-        self.transformer_level_A = nn.TransformerEncoderLayer(
-            d_model, num_heads, batch_first=batch_first, norm_first=norm_first
-        )
-        self.transformer_level_B = nn.TransformerEncoderLayer(
-            d_model, num_heads, batch_first=batch_first, norm_first=norm_first
-        )
-
-        self.transformer_level_C = nn.TransformerEncoderLayer(
-            d_model, num_heads, batch_first=batch_first, norm_first=norm_first
-        )
-
-    def forward(self, src, src_key_padding_mask, attn_mask_A, attn_mask_B):
+    def forward(self, x, src_key_padding_mask, attn_mask):
         """
         src:                [B, L, d] (batch_first=True)
-        attn_mask_A/B:      [B*num_heads, L, L] 或 None; True=禁止, False=允许
+        attn_masks:         [B*num_heads, L, L]
         src_key_padding_mask: [B, L]; True=PAD
         """
-        B, L, _ = src.shape
+        B, L, _ = x.shape
         H = self.num_heads
-        device = src.device
-
-        # ---- Phase A ----
-        yA = self.transformer_level_A(
-            src,
-            src_mask=attn_mask_A,                      # 注意参数名是 src_mask
-            src_key_padding_mask=src_key_padding_mask
-        )                                             # [B, L, d]
-
-        if attn_mask_A is not None and attn_mask_A.dim() == 3:
-            rows_A = self._rows_from_attn_mask(attn_mask_A, src_key_padding_mask, B, H)  # [B, L] True=应更新
-        else:
-            rows_A = torch.ones(B, L, dtype=torch.bool, device=device)
-
-        x = self._blend_update(src, yA, rows_A)      # 只写回允许的行
-
-        # ---- Phase B ----
-        yB = self.transformer_level_B(
-            x,
-            src_mask=attn_mask_B,
-            src_key_padding_mask=src_key_padding_mask
-        )
-
-        if attn_mask_B is not None and attn_mask_B.dim() == 3:
-            rows_B = self._rows_from_attn_mask(attn_mask_B, src_key_padding_mask, B, H)
-        else:
-            rows_B = torch.ones(B, L, dtype=torch.bool, device=device)
-
-        x = self._blend_update(x, yB, rows_B)
-
-        # ---- Phase C ----
-        x = self.transformer_level_C(
-            x,
-            src_mask=None,
-            src_key_padding_mask=src_key_padding_mask
-        )
-
+        out = self.transformer(src=x, src_key_padding_mask=src_key_padding_mask, src_mask=attn_mask)
+        rows_use = self._rows_from_attn_mask(attn_mask, src_key_padding_mask, B, H)
+        x = self._blend_update(x, out, rows_use)
         return x
 
     @staticmethod
@@ -211,3 +167,77 @@ class HierTransformerLayer(nn.Module):
         # 排除填充 token：填充 token (src_key_padding_mask == True) 不应更新
         row_updatable = row_updatable & (~src_key_padding_mask)  # [B, L]
         return row_updatable
+    
+class CLSQueryMHA(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, attn_token_type: list, dropout: float = 0.0, 
+                 use_raw_value_agg: bool = True, fallback_to_cls: bool = True):
+        super().__init__()
+        self.d_model = d_model
+        self.mha = nn.MultiheadAttention(d_model, num_heads, batch_first=True, dropout=dropout)
+        self.use_raw_value_agg = use_raw_value_agg
+        self.fallback_to_cls = fallback_to_cls
+        self.drop = nn.Dropout(dropout)
+        self.attn_token_types = attn_token_type
+
+    def forward(self, x: torch.Tensor, token_type: torch.Tensor):
+        """
+        x: [B, L, D]
+        token_type: [B, L] (long/int)
+        return:
+            out: [B, 2D]  = concat([CLS], agg)
+            attn_probs: [B, H, 1, L]  方便调试（每头的注意力）
+        """
+        B, L, D = x.shape
+        assert token_type.shape == (B, L)
+        assert D == self.d_model
+
+        # 1) CLS 作为单查询
+        cls = x[:, 0, :]                 # [B, D]
+        q   = cls.unsqueeze(1)           # [B, 1, D]
+        k   = x                          # [B, L, D]
+        v   = x                          # [B, L, D]
+
+        # 2) 构造 key_padding_mask：True=忽略（屏蔽）
+        allowed = torch.zeros_like(token_type, dtype=torch.bool)
+        for t in self.attn_token_types:
+            allowed |= (token_type == t)
+        kv_mask = ~allowed   # 非 {attn_token_types} 位置屏蔽
+        # 防止整行全 True（即没有 {6,7}）导致 softmax NaN：临时放开 CLS 位
+        no_kv = kv_mask.all(dim=1)       # [B]
+        if no_kv.any():
+            kv_mask = kv_mask.clone()
+            kv_mask[no_kv, 0] = False    # 避免 NaN；之后会覆盖聚合结果
+
+        # 3) 多头注意力（需要权重；不按头平均）
+        attn_out, attn_probs = self.mha(
+            q, k, v,
+            key_padding_mask=kv_mask,           # [B, L]；True=忽略
+            need_weights=True,
+            average_attn_weights=False          # -> [B, H, 1, L]
+        )  # attn_out: [B, 1, D]
+
+        # 4) 由注意力得到聚合向量
+        if self.use_raw_value_agg:
+            # 在“输入空间”用权重显式加权得到均值
+            w = attn_probs.mean(dim=1)         # [B, 1, L] 按头平均
+            # 置零被屏蔽位置，子集重归一化（避免数值泄漏到非 {6,7}）
+            w = w.masked_fill(kv_mask.unsqueeze(1), 0.0)  # [B, 1, L]
+            denom = w.sum(dim=-1, keepdim=True).clamp_min(1e-12)  # [B,1,1]
+            w = w / denom
+            agg = torch.bmm(w.reshape(B, 1, L), x).squeeze(1)      # [B, D]
+        else:
+            # 直接使用 MHA 的输出（已在 value 投影+out_proj 空间）
+            agg = attn_out.squeeze(1)   # [B, D]
+
+        # 5) 无 {6,7} 的样本回退策略
+        if no_kv.any():
+            if self.fallback_to_cls:
+                agg = agg.clone()
+                agg[no_kv] = cls[no_kv]    # 回退为 CLS
+            else:
+                agg = agg.clone()
+                agg[no_kv] = 0.0           # 回退为零向量
+
+        # 6) 拼接输出 [B, 2D]
+        out = torch.cat([cls, agg], dim=-1)   # [B, 2D]
+        return out  # 便于调试/正则

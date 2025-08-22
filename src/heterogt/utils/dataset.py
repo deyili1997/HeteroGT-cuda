@@ -51,10 +51,22 @@ class FineTuneEHRDataset(Dataset):
         self.tokenizer = tokenizer
         self.task = task
         self.level4_dict, _ = expand_level3()
+        self.token_type_id_dict = {
+            "PAD": 0,
+            "CLS": 1,
+            "diag": 2,
+            "med": 3,
+            "lab": 4,
+            "pro": 5,
+            "group": 6,
+            "visit": 7
+        }
         # we have 0 for PAD and 1,2,3...max_num_adms for actual adm index and max_num_adms + 1 for all group codes
         self.group_code_thre = group_code_thre # if there are group_code_thre diag codes belongs to the same group ICD code, then the group code is generated
         self.group_code_adm_index = max_num_adms + 1
-        self.group_code_type_id = 5
+        self.group_code_type_id = self.token_type_id_dict["group"]
+        self.cls_adm_index = max_num_adms + 2
+        self.cls_type_id = self.token_type_id_dict["CLS"]
 
         def transform_data(data, task):
             hadm_records = {}
@@ -101,13 +113,13 @@ class FineTuneEHRDataset(Dataset):
     
     def __getitem__(self, idx): # return tokenized input_ids, token_types, adm_index, age_sex, labels
         hadm_id = list(self.records.keys())[idx]
-        input_tokens = []
-        token_types = [] 
-        adm_index = []
+        input_tokens = ['[CLS]']
+        token_types = [self.cls_type_id]  # token type for CLS token
+        adm_index = [self.cls_adm_index]
         ages = self.ages[hadm_id] # list of ages, one for each admission
         diag_group_codes = {}
         
-        curr_pos = 0
+        curr_pos = 1 # we already have CLS token
         # iterate through all encounters in this encounter sequence
         for idx, adm in enumerate(self.records[hadm_id]):
             adm_tokens = []
@@ -118,18 +130,17 @@ class FineTuneEHRDataset(Dataset):
                 if i == 0: # if it is diag codes
                     diag_group_codes = self.find_level4_code(curr_pos, diag_group_codes, cur_tokens)
                 adm_tokens.extend(cur_tokens)
-                adm_token_types.extend([i + 1] * len(cur_tokens)) # we have 0 for PAD token, 5 for group code, 1, 2, 3, 4 for diag, med, lab, pro
+                adm_token_types.extend([i + 2] * len(cur_tokens)) # [PAD]: 0, [CLS]: 1, diag: 2, med: 3, lab: 4, pro: 5, group: 6, visit: 7
                 curr_pos += len(cur_tokens)
 
             input_tokens.extend(adm_tokens)
             token_types.extend(adm_token_types)
-            # 0 is used for PAD token
-            adm_index.extend([idx + 1] * len(adm_tokens))
+            adm_index.extend([idx + 1] * len(adm_tokens)) # 0 is used for PAD token
         
         # finally, we append the group code at the end
         diag_group_codes = self.filter_dict(diag_group_codes, self.group_code_thre, input_tokens)
         input_tokens.extend(list(diag_group_codes.keys()))
-        token_types.extend([self.group_code_type_id] * len(diag_group_codes))  # group code token type is 5
+        token_types.extend([self.group_code_type_id] * len(diag_group_codes))
         adm_index.extend([self.group_code_adm_index] * len(diag_group_codes))
         diag_group_codes = self.reindex_dict(diag_group_codes, curr_pos)  # reindex the group codes to start from curr_pos, which means append to the tail of the sequence
 
@@ -173,13 +184,13 @@ class FineTuneEHRDataset(Dataset):
         idx = torch.tensor(all_diag_pos, dtype=torch.long, device=token_types.device)
         assert (idx < token_types[0].size(0)).all(), "some idx out of range"
         vals = token_types[0][idx]
-        assert torch.all(vals == 1), f"These pos are not 1: { [p for p, v in zip(all_diag_pos, vals.tolist()) if v != 1] }"
+        assert torch.all(vals == self.token_type_id_dict['diag']), f"These pos are not diag type id: { [p for p, v in zip(all_diag_pos, vals.tolist()) if v != self.token_type_id_dict['diag']] }"
         all_group_code_pos = list(diag_group_codes.keys())
         group_code_idx = torch.tensor(all_group_code_pos, dtype=torch.long, device=token_types.device)
         group_code_type_ids = token_types[0][group_code_idx]
         group_code_adm_index = adm_index[0][group_code_idx]
         assert torch.all(group_code_type_ids == self.group_code_type_id), \
-        f"These group code pos are not 5: { [p for p, v in zip(all_group_code_pos, group_code_type_ids.tolist()) if v != 5] }"
+        f"These group code pos are not group code type id: { [p for p, v in zip(all_group_code_pos, group_code_type_ids.tolist()) if v != self.group_code_type_id] }"
         assert torch.all(group_code_adm_index == self.group_code_adm_index), \
             f"These group code adm index are not {self.group_code_adm_index}: { [p for p, v in zip(all_group_code_pos, group_code_adm_index.tolist()) if v != self.group_code_adm_index] }"
         assert (len(diag_group_codes) == (token_types[0] == self.group_code_type_id).sum().item()), \
@@ -203,6 +214,7 @@ class FineTuneEHRDataset(Dataset):
         return diag_group_codes
     
     def filter_dict(self, d, threshold, input_tokens):
+        # only keep group code with enough diag codes
         filtered_dict = {}
         for group_token, pos in d.items():
             # 从 list 中取出对应位置的 tokens
@@ -217,7 +229,7 @@ class FineTuneEHRDataset(Dataset):
         return {new_k: v for new_k, v in zip(range(current_index, current_index + len(d)), d.values())}
 
 
-def batcher(tokenizer, task_index, n_token_type=4, is_pretrain=False):
+def batcher(tokenizer, n_token_type=4, is_pretrain=False):
     def batcher_dev(batch):
         raw_input_ids, raw_token_types, raw_adm_index, raw_age_index, raw_diag_code_group_dicts, raw_labels = \
             [feat[0] for feat in batch], [feat[1] for feat in batch], [feat[2] for feat in batch], [feat[3] for feat in batch], [feat[4] for feat in batch], [feat[5] for feat in batch]
@@ -267,5 +279,5 @@ def batcher(tokenizer, task_index, n_token_type=4, is_pretrain=False):
                 (f"Row {row}: counts mismatch. "
                  f"age={count_age}, expected adm_num={expected}")
 
-        return input_ids, token_types, adm_index, age_ids, raw_diag_code_group_dicts, task_index, labels
+        return input_ids, token_types, adm_index, age_ids, raw_diag_code_group_dicts, labels
     return batcher_dev
