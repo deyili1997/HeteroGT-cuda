@@ -237,7 +237,5 @@ class CLSQueryMHA(nn.Module):
             else:
                 agg = agg.clone()
                 agg[no_kv] = 0.0           # 回退为零向量
-
-        # 6) 拼接输出 [B, 2D]
-        out = torch.cat([cls, agg], dim=-1)   # [B, 2D]
-        return out  # 便于调试/正则
+        assert agg.shape == (B, D), "CLS output shape mismatch"
+        return agg  # [B, D]

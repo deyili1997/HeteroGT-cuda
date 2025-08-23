@@ -113,8 +113,9 @@ class HeteroGT(nn.Module):
             else:
                 raise ValueError(f"Unknown layer type: {layer_type}")
         if self.use_cls_cat:
-            out = self.cls_MHA(h, token_types_full)
-            assert out.shape == (B, 2 * self.d_model), "CLS output shape mismatch"
+            cls = h[:, 0, :]
+            agg = self.cls_MHA(h, token_types_full)
+            out = torch.cat([cls, agg], dim=1)
         else:
             out = h[:, 0, :]
         logits = self.cls_head(out)
