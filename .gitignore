@@ -6,3 +6,4 @@
 *.csv
 
 data_process/
+pretrained_models/
