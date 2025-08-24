@@ -49,15 +49,19 @@ class HeteroGTPreTrain(nn.Module):
 
         # if pretrain
         if build_heads:
-            self._build_pretrain_heads(self.out_dim)
+            self.build_pretrain_heads(self.out_dim)
 
         # loss function
         self.loss_fn = F.binary_cross_entropy_with_logits
     
-    def _build_pretrain_heads(self, out_dim):
+    def build_pretrain_heads(self, out_dim):
+        # MLM task head
         for token_type in self.token_types:
             vocab_size = self.label_vocab_size[token_type]
             self.add_module(f"{token_type}_cls", MultiPredictionHead(out_dim, vocab_size))
+        # CLS ontology head
+        self.add_module(f"cls_ontology", MultiPredictionHead(self.d_model, self.tokenizer.token_number("group")))
+        self.add_module("visit_ontology", MultiPredictionHead(self.d_model, self.tokenizer.token_number("group")))
 
     def make_tf_layer(self):
         assert self.d_model % self.num_attn_heads == 0, "Invalid model and attention head dimensions"
@@ -67,21 +71,32 @@ class HeteroGTPreTrain(nn.Module):
     def make_gnn_layer(self):
         return DiseaseOccHetGNN(d_model=self.d_model, heads=self.num_attn_heads)
     
-    def forward(self, input_ids, token_types, adm_index, age_ids, diag_code_group_dicts, masked_labels):
-        out = self.run_pipeline(input_ids, token_types, adm_index, age_ids, diag_code_group_dicts)
+    def forward(self, input_ids, token_types, adm_index, age_ids, diag_code_group_dicts, labels):
+        masked_labels, group_labels = labels["masked"], labels["group"] # group_labels of shape [B, vocab size of group]
+        out, last_visit_embed = self.run_pipeline(input_ids, token_types, adm_index, age_ids, diag_code_group_dicts, return_last_visit=True)
 
-        # directly compute loss
-        avg_loss, loss_dict = 0, {}
+        # compute MLM loss
+        loss_dict = {}
         for i, token_type in enumerate(self.token_types):
-            labels = masked_labels[i].to(input_ids.device)
+            labels_type = masked_labels[i].to(input_ids.device)
             prediction = self._modules[f"{token_type}_cls"](out)
-            type_loss = self.loss_fn(prediction, labels.float())
-            loss_dict[token_type] = type_loss.item()
-            avg_loss += type_loss
+            type_loss = self.loss_fn(prediction, labels_type.float())
+            loss_dict[token_type] = type_loss
         
-        return avg_loss / len(loss_dict), loss_dict
+        # compute ontology loss using CLS
+        out_cls = out[:, :self.d_model]
+        onto_pred_cls = self._modules["cls_ontology"](out_cls)
+        onto_cls_loss = self.loss_fn(onto_pred_cls, group_labels.float().to(onto_pred_cls.device))
+        loss_dict["cls_ontology"] = onto_cls_loss
+        
+        # compute ontology loss using last visit embed
+        last_visit_onto_pred = self._modules["visit_ontology"](last_visit_embed)
+        last_visit_onto_loss = self.loss_fn(last_visit_onto_pred, group_labels.float().to(last_visit_onto_pred.device))
+        loss_dict["visit_ontology"] = last_visit_onto_loss
+
+        return loss_dict
     
-    def run_pipeline(self, input_ids, token_types, adm_index, age_ids, diag_code_group_dicts):
+    def run_pipeline(self, input_ids, token_types, adm_index, age_ids, diag_code_group_dicts, return_last_visit = False):
         """Forward pass for the model.
 
         Args:
@@ -144,7 +159,12 @@ class HeteroGTPreTrain(nn.Module):
             out = h[:, 0, :]
             assert out.shape == (B, self.d_model), "Output shape mismatch"
 
-        return out
+        if return_last_visit:
+            last_visit_embed = visit_embed[torch.arange(visit_embed.size(0)), visit_type_id_mask.sum(1) - 1] # [B, d]
+            assert last_visit_embed.shape == (B, self.d_model), "last_visit_embed shape mismatch"
+            return out, last_visit_embed
+        else:
+            return out
 
     def build_graph_batch(self, seq_embed, token_types, graph_node_types, visit_embed, adm_index):
         """Build a batch of heterogeneous graphs from the input sequences.

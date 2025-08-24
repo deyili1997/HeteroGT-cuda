@@ -119,6 +119,7 @@ class PreTrainEHRDataset(Dataset):
         ages = self.ages[subject_id] # list of ages, one for each admission
         diag_group_codes = {}
         masked_labels = [None for _ in range(len(self.token_type))]
+        group_code_label_tokens = [] # collect for pretrain task
         
         # Step 1
         global_code_pool = {code_type: set() for code_type in self.token_type}
@@ -148,14 +149,14 @@ class PreTrainEHRDataset(Dataset):
                 mask_set = masked_code_pool[code_type]
                 non_masked_tokens = [tok for tok in cur_tokens if tok not in mask_set]
                 
-                # 兜底防空token list：放回当前就诊该类型的 1 个 token
+                # important: 兜底防空token list：放回当前就诊该类型的 1 个 token
                 if len(non_masked_tokens) == 0 and len(cur_tokens) > 0:
-                    
                     keep_tok = random.choice(cur_tokens)
                     non_masked_tokens = [keep_tok]
                     
                 if i == 0: # if it is diag codes
-                    diag_group_codes = self.find_level4_code(curr_pos, diag_group_codes, non_masked_tokens)
+                    diag_group_codes = self.update_group_code_dict(curr_pos, diag_group_codes, non_masked_tokens)
+                    group_code_label_tokens.extend([self.find_level4_code(token) for token in non_masked_tokens if self.find_level4_code(token) is not None])
                 adm_tokens.extend(non_masked_tokens)
                 adm_token_types.extend([i + 2] * len(non_masked_tokens)) # +2 to distinguish from PAD and CLS tokens
                 curr_pos += len(non_masked_tokens)
@@ -166,9 +167,10 @@ class PreTrainEHRDataset(Dataset):
         
         #we append the group code at the end
         diag_group_codes = self.filter_dict(diag_group_codes, self.group_code_thre, input_tokens)
-        input_tokens.extend(list(diag_group_codes.keys()))
-        token_types.extend([self.group_code_type_id] * len(diag_group_codes))
-        adm_index.extend([self.group_code_adm_index] * len(diag_group_codes))
+        group_code_tokens = list(diag_group_codes.keys())
+        input_tokens.extend(group_code_tokens)
+        token_types.extend([self.group_code_type_id] * len(group_code_tokens))
+        adm_index.extend([self.group_code_adm_index] * len(group_code_tokens))
         diag_group_codes = self.reindex_dict(diag_group_codes, curr_pos)  # reindex the group codes to start from curr_pos, which means append to the tail of the sequence 
         
         # Step 5: build final labels directly from masked_code_pool
@@ -180,7 +182,11 @@ class PreTrainEHRDataset(Dataset):
             )
             label_vec = _id2multi_hot(label_ids, dim=self.tokenizer.token_number(self.token_type[i]))
             masked_labels[i] = label_vec.long().view(1, -1)
-        
+
+        group_code_label_id = self.tokenizer.convert_tokens_to_ids(group_code_label_tokens, voc_type = 'group')
+        group_code_label_vec = _id2multi_hot(group_code_label_id, dim=self.tokenizer.token_number('group'))
+        group_code_labels = group_code_label_vec.long()
+
         # Step 6: convert input_tokens to ids
         input_ids = torch.tensor([self.tokenizer.convert_tokens_to_ids(input_tokens, voc_type = "all")], dtype=torch.long)
         # convert token_types to tensor
@@ -190,8 +196,8 @@ class PreTrainEHRDataset(Dataset):
         # convert age_index to tensor
         age_ids = torch.tensor([self.tokenizer.convert_tokens_to_ids(ages, voc_type="all")], dtype=torch.long) 
         self.sanity_check(subject_id, input_ids, token_types, adm_index, age_ids, diag_group_codes)
-        return input_ids, token_types, adm_index, age_ids, diag_group_codes, masked_labels
-        
+        return input_ids, token_types, adm_index, age_ids, diag_group_codes, {'masked': masked_labels, 'group': group_code_labels}
+
     def sanity_check(self, id, input_ids, token_types, adm_index, age_ids, diag_group_codes):
         # sanity check
         assert input_ids.shape == token_types.shape == adm_index.shape, \
@@ -221,18 +227,22 @@ class PreTrainEHRDataset(Dataset):
         assert (group_code_ids >= group_code_id_range[0]).all() and (group_code_ids <= group_code_id_range[1]).all(), \
             f"Group code IDs {group_code_ids.tolist()} are out of range {group_code_id_range.tolist()}"
 
-    def find_level4_code(self, curr_pos, diag_group_codes, diag_codes):
+    def update_group_code_dict(self, curr_pos, diag_group_codes, diag_codes):
         pos_count = 0
         for code in diag_codes:
-            level1 = code[5:] # remove the "DIAG_"
-            level2 = level1[:4] if level1[0] == 'E' else level1[:3]
-            level4 = self.level4_dict[level2] if level2 in self.level4_dict else None
+            level4 = self.find_level4_code(code)
             if level4:
                 if level4 not in diag_group_codes:
                     diag_group_codes[level4] = []
                 diag_group_codes[level4].append(curr_pos + pos_count)
             pos_count += 1
         return diag_group_codes
+    
+    def find_level4_code(self, code):
+        level1 = code[5:] # remove the "DIAG_"
+        level2 = level1[:4] if level1[0] == 'E' else level1[:3]
+        level4 = self.level4_dict[level2] if level2 in self.level4_dict else None
+        return level4
     
     def filter_dict(self, d, threshold, input_tokens):
         # only keep group code with enough diag codes
@@ -308,7 +318,7 @@ class FineTuneEHRDataset(PreTrainEHRDataset):
             for i in range(len(adm)):
                 cur_tokens = list(adm[i])
                 if i == 0: # if it is diag codes
-                    diag_group_codes = self.find_level4_code(curr_pos, diag_group_codes, cur_tokens)
+                    diag_group_codes = self.update_group_code_dict(curr_pos, diag_group_codes, cur_tokens)
                 adm_tokens.extend(cur_tokens)
                 adm_token_types.extend([i + 2] * len(cur_tokens)) # [PAD]: 0, [CLS]: 1, diag: 2, med: 3, lab: 4, pro: 5, group: 6, visit: 7
                 curr_pos += len(cur_tokens)
@@ -376,13 +386,9 @@ def batcher(tokenizer, n_token_type=4, is_pretrain=False):
         assert input_ids.shape == token_types.shape == adm_index.shape
 
         if is_pretrain:
-            labels = []  # [n_token_type, B, n_tokens (of that code type)], 
-            # each element is a multi-hop label tensor
-            for i in range(n_token_type):
-                labels.append(torch.cat([x[i] for x in raw_labels], dim=0))
-            # convert to float tensor
-            for i in range(len(labels)):
-                labels[i] = labels[i].float()
+            masked_labels = [torch.cat([x['masked'][i] for x in raw_labels], dim=0).float() for i in range(n_token_type)]
+            group_labels = torch.stack([x['group'] for x in raw_labels], dim=0).float()
+            labels = {'masked': masked_labels, 'group': group_labels}
         else:
             labels = torch.stack(raw_labels, dim=0).float()
         
@@ -403,6 +409,5 @@ def batcher(tokenizer, n_token_type=4, is_pretrain=False):
             assert count_age == expected, \
                 (f"Row {row}: counts mismatch. "
                  f"age={count_age}, expected adm_num={expected}")
-        
         return input_ids, token_types, adm_index, age_ids, raw_diag_code_group_dicts, labels
     return batcher_dev
