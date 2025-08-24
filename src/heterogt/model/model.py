@@ -99,6 +99,7 @@ class HeteroGTPreTrain(nn.Module):
         assert len(diag_code_group_dicts) == B, "diag_code_group_dicts length does not match batch size"
         V = age_ids.shape[1]
         num_visits = (age_ids != self.age_pad_id).sum(dim=1) # [B], number of visits for each patient in the batch
+        assert torch.all(num_visits == (adm_index.masked_fill(adm_index > self.max_num_adms, -1).max(dim=1).values)), "num_visits does not match adm_index"
         
         # 基础表示
         seq_embed = self.token_emb(input_ids)  # [B, L, d]
@@ -222,7 +223,7 @@ class HeteroGTPreTrain(nn.Module):
             e_next = torch.empty(2, 0, dtype=torch.long, device=self.device)
         hg['visit','next','visit'].edge_index = e_next
         return hg
-
+    
     def process_gnn_out(self, gnn_out, num_visits, V):
         """Process the output of the GNN layer.
 
@@ -235,23 +236,36 @@ class HeteroGTPreTrain(nn.Module):
             Tensor: The processed visit embeddings. Shape [B, V, d]
         """
         B = len(num_visits)
+        total_visits = sum(num_visits).item()
+        
+        # 确保 gnn_out 的第一维与总访问次数匹配
+        assert gnn_out.size(0) == total_visits, f"gnn_out.size(0) {gnn_out.size(0)} != total_visits {total_visits}"
+        
         # 计算每个批次的累积偏移量
         cumsum = torch.cumsum(num_visits, dim=0)  # [B]
         offsets = torch.cat([torch.tensor([0], device=self.device), cumsum[:-1]])  # [B]
 
         # 创建索引以从 gnn_out 中提取所有批次的嵌入
-        indices = torch.arange(sum(num_visits), device=self.device)  # [N]
-        batch_indices = torch.repeat_interleave(torch.arange(B, device=self.device), num_visits)  # [N]
-        visit_pos = indices - offsets[batch_indices]  # [N]，每个嵌入的相对位置
+        # 修复：索引应该从 0 到 total_visits-1
+        indices = torch.arange(total_visits, device=self.device)  # [total_visits]
+        batch_indices = torch.repeat_interleave(torch.arange(B, device=self.device), num_visits)  # [total_visits]
+        visit_pos = indices - offsets[batch_indices]  # [total_visits]，每个嵌入的相对位置
 
         # 创建目标张量 visit_emb_pad，初始化为零
         visit_emb_pad = torch.zeros(B, V, self.d_model, device=self.device, dtype=gnn_out.dtype)  # [B, V, d]
 
         # 创建掩码，选择有效位置 (visit_pos < V 且 visit_pos < num_visits)
-        mask = (visit_pos < V) & (visit_pos < num_visits[batch_indices])  # [N]
+        mask = (visit_pos < V) & (visit_pos < num_visits[batch_indices])  # [total_visits]
         valid_indices = indices[mask]  # [N_valid]
         valid_batch_indices = batch_indices[mask]  # [N_valid]
         valid_visit_pos = visit_pos[mask]  # [N_valid]
+        
+        # sanity check
+        if len(valid_visit_pos) > 0:  # 只有在有有效位置时才检查
+            assert valid_visit_pos.max().item() < V, f"valid_visit_pos max {valid_visit_pos.max().item()} >= V {V}"
+            assert valid_batch_indices.max().item() < B, f"valid_batch_indices max {valid_batch_indices.max().item()} >= B {B}"
+            # 修复：索引应该 < gnn_out.size(0)，而不是 <= 
+            assert valid_indices.max().item() < gnn_out.size(0), f"valid_indices max {valid_indices.max().item()} >= gnn_out.size(0) {gnn_out.size(0)}"
 
         # 使用 scatter 将 gnn_out 的值分配到 visit_emb_pad
         visit_emb_pad[valid_batch_indices, valid_visit_pos] = gnn_out[valid_indices]

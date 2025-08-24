@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 import numpy as np
+import random
 
 def expand_level3():
     # map each ICD-9 code to a range
@@ -98,6 +99,7 @@ class PreTrainEHRDataset(Dataset):
     def _init_common_attributes(self, group_code_thre, max_num_adms):
         """初始化共同属性的辅助方法"""
         self.group_code_thre = group_code_thre
+        self.max_num_adms = max_num_adms
         self.group_code_adm_index = max_num_adms + 1
         self.group_code_type_id = self.token_type_id_dict["group"]
         self.cls_adm_index = max_num_adms + 2
@@ -118,13 +120,13 @@ class PreTrainEHRDataset(Dataset):
         diag_group_codes = {}
         masked_labels = [None for _ in range(len(self.token_type))]
         
-        # Step 1: collect global unique codes per token type for this patient
+        # Step 1
         global_code_pool = {code_type: set() for code_type in self.token_type}
         for adm in self.records[subject_id]:
             for i, codes in enumerate(adm):
                 global_code_pool[self.token_type[i]].update(codes)
 
-        # Step 2: sample masked codes per type from global pool
+        # Step 2
         masked_code_pool = {}
         for code_type in self.token_type:
             all_codes = list(global_code_pool[code_type])
@@ -145,6 +147,13 @@ class PreTrainEHRDataset(Dataset):
                 # pre-training task: mask some tokens
                 mask_set = masked_code_pool[code_type]
                 non_masked_tokens = [tok for tok in cur_tokens if tok not in mask_set]
+                
+                # 兜底防空token list：放回当前就诊该类型的 1 个 token
+                if len(non_masked_tokens) == 0 and len(cur_tokens) > 0:
+                    
+                    keep_tok = random.choice(cur_tokens)
+                    non_masked_tokens = [keep_tok]
+                    
                 if i == 0: # if it is diag codes
                     diag_group_codes = self.find_level4_code(curr_pos, diag_group_codes, non_masked_tokens)
                 adm_tokens.extend(non_masked_tokens)
@@ -179,17 +188,19 @@ class PreTrainEHRDataset(Dataset):
         # convert adm_index to tensor
         adm_index = torch.tensor([adm_index], dtype=torch.long)
         # convert age_index to tensor
-        age_ids = torch.tensor([self.tokenizer.convert_tokens_to_ids(ages, voc_type="all")], dtype=torch.long)    
+        age_ids = torch.tensor([self.tokenizer.convert_tokens_to_ids(ages, voc_type="all")], dtype=torch.long) 
         self.sanity_check(subject_id, input_ids, token_types, adm_index, age_ids, diag_group_codes)
         return input_ids, token_types, adm_index, age_ids, diag_group_codes, masked_labels
         
-    def sanity_check(self, hadm_id, input_ids, token_types, adm_index, age_ids, diag_group_codes):
+    def sanity_check(self, id, input_ids, token_types, adm_index, age_ids, diag_group_codes):
         # sanity check
         assert input_ids.shape == token_types.shape == adm_index.shape, \
             f"Input IDs shape {input_ids.shape}, token types shape {token_types.shape}, adm index shape {adm_index.shape} do not match"
-        assert age_ids.size(1) == len(self.records[hadm_id]), \
-            f"Age index length {age_ids.size(1)} does not match input IDs length {len(self.records[hadm_id])}"
-        
+        assert age_ids.size(1) == len(self.records[id]), \
+            f"Age index length {age_ids.size(1)} does not match input IDs length {len(self.records[id])}"
+        assert torch.unique(adm_index[0][(adm_index[0] > 0) & (adm_index[0] <= self.max_num_adms)]).numel() == age_ids.size(1), \
+            f"Admission unique count {torch.unique(adm_index[0][(adm_index[0] > 0) & (adm_index[0] <= self.max_num_adms)]).numel()} does not match age index size {age_ids.size(1)}"
+
         all_diag_pos = sum(diag_group_codes.values(), [])
         idx = torch.tensor(all_diag_pos, dtype=torch.long, device=token_types.device)
         assert (idx < token_types[0].size(0)).all(), "some idx out of range"
@@ -392,6 +403,6 @@ def batcher(tokenizer, n_token_type=4, is_pretrain=False):
             assert count_age == expected, \
                 (f"Row {row}: counts mismatch. "
                  f"age={count_age}, expected adm_num={expected}")
-
+        
         return input_ids, token_types, adm_index, age_ids, raw_diag_code_group_dicts, labels
     return batcher_dev
