@@ -53,7 +53,7 @@ def _id2multi_hot(ids, dim):
     return multi_hot
 
 class PreTrainEHRDataset(Dataset):
-    def __init__(self, ehr_pretrain_data, tokenizer, token_type, mask_rate, group_code_thre, max_num_adms):
+    def __init__(self, ehr_pretrain_data, tokenizer, token_type, mask_rate, group_code_thre, max_num_adms, skip_transform=False):
         self.tokenizer = tokenizer
         self.token_type = token_type
         assert mask_rate > 0, "Mask rate must be greater than 0"
@@ -97,7 +97,9 @@ class PreTrainEHRDataset(Dataset):
                 ages[subject_id] = list(age)
                 hadm_types[subject_id] = list(adm_type)
             return hadm_records, ages, hadm_types
-        self.records, self.ages, self.adm_types = _transform_pretrain_data(ehr_pretrain_data)
+        
+        if not skip_transform:  # in case process data 2 times in the Finetinue dataset
+            self.records, self.ages, self.adm_types = _transform_pretrain_data(ehr_pretrain_data)
 
     def _init_common_attributes(self, group_code_thre, max_num_adms):
         """初始化共同属性的辅助方法"""
@@ -272,7 +274,7 @@ class PreTrainEHRDataset(Dataset):
 class FineTuneEHRDataset(PreTrainEHRDataset):
     def __init__(self, ehr_finetune_data, tokenizer, token_type, task, max_num_adms, group_code_thre):
         super().__init__(ehr_finetune_data, tokenizer, token_type, mask_rate=0.1, 
-                         group_code_thre=group_code_thre, max_num_adms=max_num_adms)
+                         group_code_thre=group_code_thre, max_num_adms=max_num_adms, skip_transform=True)
         self.task = task
         
         def _transform_finetune_data(data, task):
