@@ -119,7 +119,7 @@ class PreTrainEHRDataset(Dataset):
         ages = self.ages[subject_id] # list of ages, one for each admission
         diag_group_codes = {}
         masked_labels = [None for _ in range(len(self.token_type))]
-        group_code_label_tokens = [] # collect for pretrain task
+        
         
         # Step 1
         global_code_pool = {code_type: set() for code_type in self.token_type}
@@ -156,7 +156,7 @@ class PreTrainEHRDataset(Dataset):
                     
                 if i == 0: # if it is diag codes
                     diag_group_codes = self.update_group_code_dict(curr_pos, diag_group_codes, non_masked_tokens)
-                    group_code_label_tokens.extend([self.find_level4_code(token) for token in non_masked_tokens if self.find_level4_code(token) is not None])
+                    # here we predict the ontology of the masked diag codes
                 adm_tokens.extend(non_masked_tokens)
                 adm_token_types.extend([i + 2] * len(non_masked_tokens)) # +2 to distinguish from PAD and CLS tokens
                 curr_pos += len(non_masked_tokens)
@@ -183,6 +183,7 @@ class PreTrainEHRDataset(Dataset):
             label_vec = _id2multi_hot(label_ids, dim=self.tokenizer.token_number(self.token_type[i]))
             masked_labels[i] = label_vec.long().view(1, -1)
 
+        group_code_label_tokens = [self.find_level4_code(token) for token in masked_code_pool['diag'] if self.find_level4_code(token) is not None] # collect for pretrain task
         group_code_label_id = self.tokenizer.convert_tokens_to_ids(group_code_label_tokens, voc_type = 'group')
         group_code_label_vec = _id2multi_hot(group_code_label_id, dim=self.tokenizer.token_number('group'))
         group_code_labels = group_code_label_vec.long()
