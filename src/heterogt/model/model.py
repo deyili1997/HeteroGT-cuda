@@ -60,8 +60,9 @@ class HeteroGTPreTrain(nn.Module):
             vocab_size = self.label_vocab_size[token_type]
             self.add_module(f"{token_type}_cls", MultiPredictionHead(out_dim, vocab_size))
         # CLS ontology head
-        self.add_module(f"cls_ontology", MultiPredictionHead(self.d_model, self.tokenizer.token_number("group")))
+        self.add_module("cls_ontology", MultiPredictionHead(self.d_model, self.tokenizer.token_number("group")))
         self.add_module("visit_ontology", MultiPredictionHead(self.d_model, self.tokenizer.token_number("group")))
+        self.add_module("adm_type", MultiPredictionHead(out_dim, self.tokenizer.token_number("adm_type")))
 
     def make_tf_layer(self):
         assert self.d_model % self.num_attn_heads == 0, "Invalid model and attention head dimensions"
@@ -72,7 +73,7 @@ class HeteroGTPreTrain(nn.Module):
         return DiseaseOccHetGNN(d_model=self.d_model, heads=self.num_attn_heads)
     
     def forward(self, input_ids, token_types, adm_index, age_ids, diag_code_group_dicts, labels):
-        masked_labels, group_labels = labels["masked"], labels["group"] # group_labels of shape [B, vocab size of group]
+        masked_labels, group_labels, adm_type_labels = labels["masked"], labels["group"], labels["adm_type"] # group_labels of shape [B, vocab size of group]
         out, last_visit_embed = self.run_pipeline(input_ids, token_types, adm_index, age_ids, diag_code_group_dicts, return_last_visit=True)
 
         # compute MLM loss
@@ -93,6 +94,11 @@ class HeteroGTPreTrain(nn.Module):
         last_visit_onto_pred = self._modules["visit_ontology"](last_visit_embed)
         last_visit_onto_loss = self.loss_fn(last_visit_onto_pred, group_labels.float().to(last_visit_onto_pred.device))
         loss_dict["visit_ontology"] = last_visit_onto_loss
+        
+        # compute adm type loss using the full out
+        adm_type_pred = self._modules["adm_type"](out)
+        adm_type_loss = self.loss_fn(adm_type_pred, adm_type_labels.float().to(adm_type_pred.device))
+        loss_dict["adm_type"] = adm_type_loss
 
         return loss_dict
     

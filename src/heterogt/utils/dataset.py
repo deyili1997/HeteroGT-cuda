@@ -75,9 +75,10 @@ class PreTrainEHRDataset(Dataset):
         def _transform_pretrain_data(data):
             hadm_records = {}  # including current admission and previous admissions
             ages = {}
+            hadm_types = {}
             for subject_id in data['SUBJECT_ID'].unique():
                 item_df = data[data['SUBJECT_ID'] == subject_id]
-                patient, age = [], []
+                patient, age, adm_type = [], [], []
                 for _, row in item_df.iterrows():
                     admission = []
                     if "diag" in token_type:
@@ -90,12 +91,14 @@ class PreTrainEHRDataset(Dataset):
                         admission.append(list(row['PRO_CODE']))
                     patient.append(admission)
                     age.append(row['AGE'])
+                    adm_type.append(row['ADMISSION_TYPE'])
                     
                 hadm_records[subject_id] = list(patient)
                 ages[subject_id] = list(age)
-            return hadm_records, ages
-        self.records, self.ages = _transform_pretrain_data(ehr_pretrain_data)
-    
+                hadm_types[subject_id] = list(adm_type)
+            return hadm_records, ages, hadm_types
+        self.records, self.ages, self.adm_types = _transform_pretrain_data(ehr_pretrain_data)
+
     def _init_common_attributes(self, group_code_thre, max_num_adms):
         """初始化共同属性的辅助方法"""
         self.group_code_thre = group_code_thre
@@ -117,9 +120,9 @@ class PreTrainEHRDataset(Dataset):
         token_types = [self.cls_type_id]  # token type for CLS token
         adm_index = [self.cls_adm_index]
         ages = self.ages[subject_id] # list of ages, one for each admission
+        adm_types = self.adm_types[subject_id] # list of adm types, one for each admission
         diag_group_codes = {}
         masked_labels = [None for _ in range(len(self.token_type))]
-        
         
         # Step 1
         global_code_pool = {code_type: set() for code_type in self.token_type}
@@ -183,10 +186,16 @@ class PreTrainEHRDataset(Dataset):
             label_vec = _id2multi_hot(label_ids, dim=self.tokenizer.token_number(self.token_type[i]))
             masked_labels[i] = label_vec.long().view(1, -1)
 
+        # build group code label for masked diag codes
         group_code_label_tokens = [self.find_level4_code(token) for token in masked_code_pool['diag'] if self.find_level4_code(token) is not None] # collect for pretrain task
         group_code_label_id = self.tokenizer.convert_tokens_to_ids(group_code_label_tokens, voc_type = 'group')
         group_code_label_vec = _id2multi_hot(group_code_label_id, dim=self.tokenizer.token_number('group'))
         group_code_labels = group_code_label_vec.long()
+        
+        # build adm types label
+        adm_type_ids = self.tokenizer.convert_tokens_to_ids(adm_types, voc_type="adm_type")
+        adm_type_label_vec = _id2multi_hot(adm_type_ids, dim=self.tokenizer.token_number('adm_type'))
+        adm_type_labels = adm_type_label_vec.long()
 
         # Step 6: convert input_tokens to ids
         input_ids = torch.tensor([self.tokenizer.convert_tokens_to_ids(input_tokens, voc_type = "all")], dtype=torch.long)
@@ -197,7 +206,7 @@ class PreTrainEHRDataset(Dataset):
         # convert age_index to tensor
         age_ids = torch.tensor([self.tokenizer.convert_tokens_to_ids(ages, voc_type="all")], dtype=torch.long) 
         self.sanity_check(subject_id, input_ids, token_types, adm_index, age_ids, diag_group_codes)
-        return input_ids, token_types, adm_index, age_ids, diag_group_codes, {'masked': masked_labels, 'group': group_code_labels}
+        return input_ids, token_types, adm_index, age_ids, diag_group_codes, {'masked': masked_labels, 'group': group_code_labels, 'adm_type': adm_type_labels}
 
     def sanity_check(self, id, input_ids, token_types, adm_index, age_ids, diag_group_codes):
         # sanity check
@@ -389,7 +398,8 @@ def batcher(tokenizer, n_token_type=4, is_pretrain=False):
         if is_pretrain:
             masked_labels = [torch.cat([x['masked'][i] for x in raw_labels], dim=0).float() for i in range(n_token_type)]
             group_labels = torch.stack([x['group'] for x in raw_labels], dim=0).float()
-            labels = {'masked': masked_labels, 'group': group_labels}
+            adm_type_labels = torch.stack([x['adm_type'] for x in raw_labels], dim=0).float()
+            labels = {'masked': masked_labels, 'group': group_labels, 'adm_type': adm_type_labels}
         else:
             labels = torch.stack(raw_labels, dim=0).float()
         

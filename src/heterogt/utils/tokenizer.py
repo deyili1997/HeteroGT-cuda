@@ -15,7 +15,7 @@ class Voc(object):
                 
 class EHRTokenizer(object):
     def __init__(self, age_sentences, group_code_sentences, diag_sentences, med_sentences, lab_sentences, 
-                 pro_sentences, special_tokens):
+                 pro_sentences, special_tokens, adm_types_sentences):
         # this is the global vocabulary, including special tokens (pad and cls), age, group_code, diag, med, lab, pro
         self.vocab = Voc() 
 
@@ -32,6 +32,9 @@ class EHRTokenizer(object):
         self.med_voc = self.add_vocab(med_sentences)
         self.lab_voc = self.add_vocab(lab_sentences)
         self.pro_voc = self.add_vocab(pro_sentences)
+        
+        self.adm_type_voc = Voc()   # adm type is independent of the global vocab, just for pretrain
+        self.adm_type_voc.add_sentence(adm_types_sentences)
 
         assert len(special_tokens) + len(self.age_voc.id2word) + len(self.group_code_voc.id2word) + \
             len(self.diag_voc.id2word) + len(self.med_voc.id2word) + len(self.lab_voc.id2word) + len(self.pro_voc.id2word) == len(self.vocab.id2word)
@@ -64,6 +67,8 @@ class EHRTokenizer(object):
                 ids.append(self.pro_voc.word2id[token])
             elif voc_type == "age":
                 ids.append(self.age_voc.word2id[token])
+            elif voc_type == "adm_type":
+                ids.append(self.adm_type_voc.word2id[token])
             else:
                 raise ValueError(f"Unknown vocabulary type: {voc_type}")
         return ids
@@ -86,6 +91,8 @@ class EHRTokenizer(object):
                 tokens.append(self.pro_voc.id2word[i])
             elif voc_type == "age":
                 tokens.append(self.age_voc.id2word[i])
+            elif voc_type == "adm_type":
+                tokens.append(self.adm_type_voc.id2word[i])
             else:
                 raise ValueError(f"Unknown vocabulary type: {voc_type}")
         return tokens
@@ -129,6 +136,8 @@ class EHRTokenizer(object):
             return len(self.pro_voc.id2word)
         elif voc_type == "age":
             return len(self.age_voc.id2word)
+        elif voc_type == "adm_type":
+            return len(self.adm_type_voc.id2word)
         else:
             raise ValueError(f"Unknown vocabulary type: {voc_type}")
 
@@ -146,5 +155,7 @@ class EHRTokenizer(object):
             return self.age_voc.id2word[np.random.randint(len(self.age_voc.id2word))]
         elif voc_type == "group":
             return self.group_code_voc.id2word[np.random.randint(len(self.group_code_voc.id2word))]
+        elif voc_type == "adm_type":
+            return self.adm_type_voc.id2word[np.random.randint(len(self.adm_type_voc.id2word))]
         else:
             raise ValueError(f"Unknown vocabulary type: {voc_type}")
