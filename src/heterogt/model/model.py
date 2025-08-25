@@ -151,8 +151,8 @@ class HeteroGTPreTrain(nn.Module):
                 assert visit_embed.shape == (B, V, self.d_model), "GNN output shape mismatch"
             elif layer_type == 'tf':
                 x, attn_mask_l = self.prepare_tf_input(seq_embed, visit_embed, tf_layers_count, adm_index_full, token_types_full, self.attn_mask_dicts, diag_code_group_dicts)
-                h = self.stack_layers[i](x, src_key_padding_mask, attn_mask_l) # [B, 1+L+V, d]
-                seq_embed, visit_embed = self.process_tf_out(h, L, V) # # [B, 1, d], [B, L, d], [B, V, d]
+                h = self.stack_layers[i](x, src_key_padding_mask, attn_mask_l) # [B, L+V, d]
+                seq_embed, visit_embed = self.process_tf_out(h, L, V) # [B, L, d], [B, V, d]
                 tf_layers_count += 1
             else:
                 raise ValueError(f"Unknown layer type: {layer_type}")
