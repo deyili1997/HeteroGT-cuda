@@ -479,11 +479,7 @@ class HeteroGTFineTune(HeteroGTPreTrain):
             self.cls_head = MultiPredictionHead(self.out_dim, label_vocab_size)
     
     def load_weight(self, checkpoint_dict, strict=False):
-        missing_keys, unexpected_keys = self.load_state_dict(checkpoint_dict, strict=strict)
-        if missing_keys:
-            print(f"[Warning] Missing keys: {missing_keys}")
-        if unexpected_keys:
-            print(f"[Warning] Unexpected keys: {unexpected_keys}")
+        self.load_state_dict(checkpoint_dict, strict=strict)
     
     def forward(self, input_ids, token_types, adm_index, age_ids, diag_code_group_dicts):
         out, dec_loss = self.run_pipeline(input_ids, token_types, adm_index, age_ids, diag_code_group_dicts, return_group_dec_loss=True)

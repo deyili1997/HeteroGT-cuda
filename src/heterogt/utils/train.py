@@ -19,6 +19,7 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
     best_score = 0.0
     best_val_metric = None
     best_test_metric = None
+    best_test_long_seq_metric = None
     best_model_state = deepcopy(model.state_dict())
     epochs_no_improve = 0
 
@@ -90,12 +91,12 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
                 pass
 
         # 验证 + 早停
-        (best_score, best_val_metric, best_test_metric, best_model_state,
+        (best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, best_model_state,
          epochs_no_improve, early_stop_triggered) = evaluate_and_early_stop(
             model, val_dataloader, test_dataloader, device, task_type,
             val_long_seq_idx, test_long_seq_idx, eval_metric,
-            best_score, best_val_metric, best_test_metric, best_model_state,
-            epochs_no_improve, early_stop_patience
+            best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, 
+            best_model_state, epochs_no_improve, early_stop_patience
         )
         if early_stop_triggered:
             break
@@ -104,15 +105,21 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
     print(best_val_metric)
     print("Corresponding test performance:")
     print(best_test_metric)
+    if best_test_long_seq_metric is not None:
+        print("Corresponding test-long performance:")
+        print(best_test_long_seq_metric)
 
     model.load_state_dict(best_model_state)
-    return (best_test_metric, model) if return_model else best_test_metric
+    if return_model:
+        return (best_test_metric, best_test_long_seq_metric, model)
+    else:
+        return best_test_metric, best_test_long_seq_metric
 
 
 def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task_type,
                                   val_long_seq_idx, test_long_seq_idx, eval_metric,
-                                  best_score, best_val_metric, best_test_metric, best_model_state,
-                                  epochs_no_improve, early_stop_patience):
+                                  best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, 
+                                  best_model_state, epochs_no_improve, early_stop_patience):
     """
     执行模型在验证集和测试集的评估，并进行早停检查。
     返回：
@@ -137,12 +144,11 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
         test_long_seq_metric = None
 
     print(f"Validation: {val_metric}")
+    print(f"Test:      {test_metric}\n")
     if val_long_seq_metric is not None:
         print(f"Validation-long: {val_long_seq_metric}")
-
-    print(f"Test:      {test_metric}")
     if test_long_seq_metric is not None:
-        print(f"Test-long: {test_long_seq_metric}")
+        print(f"Test-long: {test_long_seq_metric}\n")
 
     # --- Early Stopping ---
     current_score = val_metric[eval_metric]
@@ -152,6 +158,7 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
         best_score = current_score
         best_val_metric = val_metric
         best_test_metric = test_metric
+        best_test_long_seq_metric = test_long_seq_metric
         best_model_state = deepcopy(model.state_dict())
         epochs_no_improve = 0
     else:
@@ -160,7 +167,7 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
             print(f"\nEarly stopping triggered (no improvement for {early_stop_patience} epochs).")
             early_stop_triggered = True
 
-    return best_score, best_val_metric, best_test_metric, best_model_state, epochs_no_improve, early_stop_triggered
+    return best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, best_model_state, epochs_no_improve, early_stop_triggered
 
 
 def run_multilabel_metrics(predictions, labels):
@@ -192,14 +199,19 @@ def run_multilabel_metrics(predictions, labels):
         f1s.append(f1)
         aucs.append(auc_score)
         praucs.append(pr_auc_score)
-
-    return {
+    
+    metrics = {
         "precision": np.nanmean(precisions),
         "recall": np.nanmean(recalls),
         "f1": np.nanmean(f1s),
         "auc": np.nanmean(aucs),
         "prauc": np.nanmean(praucs),
     }
+    
+    for m, v in metrics.items():
+        metrics[m] = round(v * 100, 4)
+
+    return metrics
 
 
 def run_binary_metrics(predictions, labels):
@@ -215,14 +227,16 @@ def run_binary_metrics(predictions, labels):
     rocauc = roc_auc_score(labels.numpy(), scores)
     prec_curve, rec_curve, _ = precision_recall_curve(labels.numpy(), scores)
     prauc = auc(rec_curve, prec_curve)
-
-    return {
+    metrics = {
         "precision": precision,
         "recall": recall,
         "f1": f1,
         "auc": rocauc,
         "prauc": prauc,
     }
+    for m, v in metrics.items():
+        metrics[m] = round(v * 100, 4)
+    return metrics
 
 @torch.no_grad()
 def evaluate(model, dataloader, device, task_type, long_seq_idx=None):
