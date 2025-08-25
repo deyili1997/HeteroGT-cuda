@@ -8,7 +8,7 @@ from contextlib import nullcontext
 
 
 def train_with_early_stopping(model, train_dataloader, val_dataloader, test_dataloader,
-                              optimizer, loss_fn, device, early_stop_patience, task_type, epochs,
+                              optimizer, loss_fn, device, early_stop_patience, task_type, epochs, dec_loss_lambda = 0, 
                               val_long_seq_idx=None, test_long_seq_idx=None, eval_metric="prauc", return_model=False):
 
     # ---- 设备与AMP开关 ----
@@ -44,8 +44,9 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
 
             try:
                 with amp_ctx:
-                    preds = model(*batch[:-1])
-                    loss = loss_fn(preds.view(-1), labels.view(-1))
+                    preds, dec_loss = model(*batch[:-1])
+                    task_loss = loss_fn(preds.view(-1), labels.view(-1))
+                    loss = task_loss + dec_loss_lambda * dec_loss
 
                 if use_amp:
                     # AMP 路径

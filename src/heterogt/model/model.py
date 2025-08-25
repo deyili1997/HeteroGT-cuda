@@ -1,3 +1,4 @@
+from multiprocessing import reduction
 import torch
 import torch.nn as nn
 from torch_geometric.data import HeteroData, Batch as HeteroBatch
@@ -101,8 +102,9 @@ class HeteroGTPreTrain(nn.Module):
         loss_dict["adm_type"] = adm_type_loss
 
         return loss_dict
-    
-    def run_pipeline(self, input_ids, token_types, adm_index, age_ids, diag_code_group_dicts, return_last_visit = False):
+
+    def run_pipeline(self, input_ids, token_types, adm_index, age_ids, diag_code_group_dicts, 
+                     return_group_dec_loss=False, return_last_visit=False):
         """Forward pass for the model.
 
         Args:
@@ -111,7 +113,6 @@ class HeteroGTPreTrain(nn.Module):
             adm_index (Tensor): Admission index IDs. Shape of [B, L], including tokens of [CLS], diag, med, lab, pro, and group code, no visit code yet
             age_ids (Tensor): Age IDs. Shape of [B, V]
             diag_code_group_dicts (list): len of B, dictionaries mapping group code idx to their corresponding diag code idx.
-
         Returns:
             Tensor: Output logits. Shape of [B, label_size]
         """
@@ -136,6 +137,7 @@ class HeteroGTPreTrain(nn.Module):
         visit_type_id = torch.full((B, V), self.node_type_id_dict['visit'], dtype=torch.long, device=self.device)  # [B, V]
         visit_type_id_mask = (visit_adm_index != self.adm_pad_id).long() # [B, V]
         visit_type_id = visit_type_id * visit_type_id_mask # [B, V]
+        # concat seq and visit
         token_types_full = torch.cat([token_types, visit_type_id], dim=1)  # [B, L+V]
         adm_index_full = torch.cat([adm_index, visit_adm_index], dim=1)  # [B, L+V]
 
@@ -156,6 +158,11 @@ class HeteroGTPreTrain(nn.Module):
                 tf_layers_count += 1
             else:
                 raise ValueError(f"Unknown layer type: {layer_type}")
+        
+        # we only use decoupling loss at the last layer of transformer output
+        if return_group_dec_loss:
+            dec_loss = self.decouple_by_type_corr(seq_embed, token_types, type_id=self.node_type_id_dict['group'], diag_weight=1.0, reduction="mean")
+        
         if self.use_cls_cat:
             cls = h[:, 0, :]
             agg = self.cls_MHA(h, token_types_full)
@@ -165,12 +172,14 @@ class HeteroGTPreTrain(nn.Module):
             out = h[:, 0, :]
             assert out.shape == (B, self.d_model), "Output shape mismatch"
 
-        if return_last_visit:
+        if return_last_visit and not return_group_dec_loss: # for pretrain
             last_visit_embed = visit_embed[torch.arange(visit_embed.size(0)), visit_type_id_mask.sum(1) - 1] # [B, d]
             assert last_visit_embed.shape == (B, self.d_model), "last_visit_embed shape mismatch"
             return out, last_visit_embed
+        elif not return_last_visit and return_group_dec_loss: # for finetune
+            return out, dec_loss
         else:
-            return out
+            raise ValueError("Not any of the pretrain/fintune situation!")
 
     def build_graph_batch(self, seq_embed, token_types, graph_node_types, visit_embed, adm_index):
         """Build a batch of heterogeneous graphs from the input sequences.
@@ -351,6 +360,53 @@ class HeteroGTPreTrain(nn.Module):
         # h: [B, L+V, d]。其中 h[:, 0, :] 为 [CLS]（或序列首位）
         assert h.shape[1] == L + V, "Transformer output length mismatch"
         return h[:, :L, :], h[:, L:, :]
+    
+    @staticmethod
+    def decouple_by_type_corr(
+        seq_embed: torch.Tensor,    # [B, L, D]
+        token_types: torch.Tensor,  # [B, L]
+        type_id: int,
+        eps: float = 1e-5,
+        diag_weight: float = 1.0,
+        reduction: str = "mean") -> torch.Tensor:
+        assert reduction in ("mean", "sum"), "reduction must be 'mean' or 'sum'"
+
+        B, L, D = seq_embed.shape
+        mask = (token_types == type_id)      # [B, L]
+        m_per_b = mask.sum(dim=1)            # [B]
+        valid = m_per_b > 1
+
+        if not valid.any():
+            return seq_embed.sum() * 0.0
+
+        losses = []
+        for b in range(B):
+            if not valid[b]:
+                continue
+
+            m = int(m_per_b[b].item())
+            Z = seq_embed[b, mask[b], :]               # [m, D]
+
+            # 按通道（D 维）做 z-score：每个 token 向量零均值、单位方差
+            Z = Z - Z.mean(dim=1, keepdim=True)
+            std = Z.var(dim=1, unbiased=False, keepdim=True).add(eps).sqrt()
+            Z = Z / std                                 # [m, D]
+
+            # 相关矩阵（把 D 当“样本数”）
+            X = Z.transpose(0, 1)                        # [D, m]
+            C = (X.T @ X) / X.shape[0]                   # [m, m]
+
+            off_mask = ~torch.eye(m, device=Z.device, dtype=torch.bool)
+            loss_off = (C[off_mask] ** 2).mean()         # 平均每个非对角元素
+
+            loss_diag = 0.0
+            if diag_weight > 0:
+                loss_diag = diag_weight * ((torch.diag(C) - 1.0) ** 2).mean()
+
+            losses.append(loss_off + loss_diag)
+
+        loss = torch.stack(losses)
+        return loss.mean() if reduction == "mean" else loss.sum()
         
     @staticmethod
     def build_attn_mask(token_types, forbid_map, num_heads, allow_attn_dicts):
@@ -430,6 +486,6 @@ class HeteroGTFineTune(HeteroGTPreTrain):
             print(f"[Warning] Unexpected keys: {unexpected_keys}")
     
     def forward(self, input_ids, token_types, adm_index, age_ids, diag_code_group_dicts):
-        out = self.run_pipeline(input_ids, token_types, adm_index, age_ids, diag_code_group_dicts)
+        out, dec_loss = self.run_pipeline(input_ids, token_types, adm_index, age_ids, diag_code_group_dicts, return_group_dec_loss=True)
         logits = self.cls_head(out)
-        return logits
+        return logits, dec_loss
