@@ -163,6 +163,21 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
     else:
         test_metric = evaluate(model, test_dataloader, device, task_type)
         test_long_seq_metric = None
+        
+    if task_type != "binary":
+        per_class_val_df = val_metric["per_class"]
+        val_metric = val_metric["global"]
+        per_class_test_df = test_metric["per_class"]
+        test_metric = test_metric["global"]
+        
+        if val_long_seq_metric is not None:
+            per_class_val_long_seq_df = val_long_seq_metric["per_class"]
+            val_long_seq_metric = val_long_seq_metric["global"]
+            
+        if test_long_seq_metric is not None:
+            per_class_test_long_seq_df = test_long_seq_metric["per_class"]
+            test_long_seq_metric = test_long_seq_metric["global"]
+            
 
     print(f"Validation: {val_metric}")
     print(f"Test:      {test_metric}\n")
@@ -177,9 +192,9 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
 
     if current_score > best_score:
         best_score = current_score
-        best_val_metric = val_metric
-        best_test_metric = test_metric
-        best_test_long_seq_metric = test_long_seq_metric
+        best_val_metric = val_metric if task_type == "binary" else {"global": val_metric, "per_class": per_class_val_df}
+        best_test_metric = test_metric if task_type == "binary" else {"global": test_metric, "per_class": per_class_test_df}
+        best_test_long_seq_metric = test_long_seq_metric if task_type == "binary" else {"global": test_long_seq_metric, "per_class": per_class_test_long_seq_df}
         best_model_state = deepcopy(model.state_dict())
         epochs_no_improve = 0
     else:
@@ -371,12 +386,10 @@ def evaluate(model, dataloader, device, task_type, long_seq_idx=None):
             return results
     else:
         results, per_class_df = run_multilabel_metrics(predictions, labels)
-        print(per_class_df)
         if long_seq_idx is not None:
             long_seq_results, long_seq_per_class_df = run_multilabel_metrics(
                 _select_long_seq(predictions), _select_long_seq(labels)
             )
-            print(long_seq_per_class_df)
-            return results, long_seq_results
+            return {"global": results, "per_class": per_class_df}, {"global": long_seq_results, "per_class": long_seq_per_class_df}
         else:
-            return results
+            return {"global": results, "per_class": per_class_df}
