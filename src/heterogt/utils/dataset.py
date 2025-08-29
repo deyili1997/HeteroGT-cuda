@@ -304,10 +304,11 @@ class FineTuneEHRDataset(PreTrainEHRDataset):
                         ages[hadm_id] = list(age)
                         labels[hadm_id] = [row["DEATH"], row["STAY_DAYS"], row["READMISSION"]]
                     else: # next diagnosis prediction
-                        label = row["NEXT_DIAG_6M"] if task == "next_diag_6m" else row["NEXT_DIAG_12M"]
-                        if str(label) != "nan":  # only include the admission with next diagnosis
+                        flag = row["NEXT_DIAG_6M"] if task == "next_diag_6m" else row["NEXT_DIAG_12M"]
+                        if str(flag) != "nan":  # only include the admission with next diagnosis
                             hadm_records[hadm_id] = list(patient) # this is why this line is inside the if statement
                             ages[hadm_id] = list(age)
+                            label = row["NEXT_DIAG_6M_PHENO"] if task == "next_diag_6m" else row["NEXT_DIAG_12M_PHENO"]
                             labels[hadm_id] = list(label)
             return hadm_records, ages, labels
 
@@ -356,14 +357,11 @@ class FineTuneEHRDataset(PreTrainEHRDataset):
         elif self.task == "readmission":
             # predict if the patient will be readmitted within 1 month
             labels = torch.tensor([self.labels[hadm_id][2]]).float()
-        else:  # next diagnosis prediction
-            # we abandon the last encounter insertion here (in the original paper) because we will use the CLS token as the patient representation
-            # and this representation will further go through a hypergraph to do information exchange.
-            label_ids = torch.tensor(self.tokenizer.convert_tokens_to_ids(self.labels[hadm_id], voc_type='diag'))
-            labels = _id2multi_hot(label_ids, dim=self.tokenizer.token_number('diag'))
-        
+        else:  # next diagnosis prediction, the label is already binary
+            labels = torch.tensor(self.labels[hadm_id]).float()
+
         # convert input_tokens to ids
-        input_ids = torch.tensor([self.tokenizer.convert_tokens_to_ids(input_tokens, voc_type = "all")], dtype=torch.long)
+        input_ids = torch.tensor([self.tokenizer.convert_tokens_to_ids(input_tokens, voc_type="all")], dtype=torch.long)
         # convert token_types to tensor
         token_types = torch.tensor([token_types], dtype=torch.long)
         # convert adm_index to tensor

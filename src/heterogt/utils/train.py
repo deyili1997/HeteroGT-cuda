@@ -2,10 +2,31 @@ import torch
 from copy import deepcopy
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, precision_recall_fscore_support
 import numpy as np
 from contextlib import nullcontext
+import pandas as pd
 
+PHENO_ORDER = [
+    "Acute and unspecified renal failure",
+    "Acute cerebrovascular disease",
+    "Acute myocardial infarction",
+    "Cardiac dysrhythmias",
+    "Chronic kidney disease",
+    "Chronic obstructive pulmonary disease",
+    "Conduction disorders",
+    "Congestive heart failure; nonhypertensive",
+    "Coronary atherosclerosis and related",
+    "Disorders of lipid metabolism",
+    "Essential hypertension",
+    "Fluid and electrolyte disorders",
+    "Gastrointestinal hemorrhage",
+    "Hypertension with complications",
+    "Other liver diseases",
+    "Other lower respiratory disease",
+    "Pneumonia",
+    "Septicemia (except in labor)",
+]
 
 def train_with_early_stopping(model, train_dataloader, val_dataloader, test_dataloader,
                               optimizer, loss_fn, device, early_stop_patience, task_type, epochs, dec_loss_lambda = 0, 
@@ -169,49 +190,112 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
 
     return best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, best_model_state, epochs_no_improve, early_stop_triggered
 
+def run_multilabel_metrics(
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    threshold: float = 0.5,
+    predictions_are_logits: bool = True,
+):
+    """
+    返回 (global_metrics, per_class_df)
 
-def run_multilabel_metrics(predictions, labels):
-    # Multi-label classification: predictions [B, C], labels [B, C]
-    f1s, aucs, praucs, precisions, recalls = [], [], [], [], []
+    global_metrics: dict
+      {
+        "precision": 宏平均,
+        "recall":    宏平均,
+        "f1":        宏平均,
+        "auc":       宏平均,
+        "prauc":     宏平均
+      }
+    per_class_df: pd.DataFrame
+      每行一个类别，每列 precision/recall/f1/auc/prauc（百分比；AUC/PR-AUC 遇到单一类别为 None）
+    """
+    assert predictions.ndim == 2 and labels.ndim == 2, "predictions/labels must be [B, C]"
+    assert predictions.shape == labels.shape, "shape mismatch [B, C]"
+    B, C = predictions.shape
 
-    for i in range(predictions.size(0)):
-        pred_i = predictions[i].clone()
-        label_i = labels[i].clone()
+    # 1) 连续分数（用于 AUC / PR-AUC）
+    with torch.no_grad():
+        if predictions_are_logits:
+            # CPU half 无 sigmoid 实现时升级到 fp32
+            if predictions.device.type == "cpu" and predictions.dtype == torch.float16:
+                scores_t = torch.sigmoid(predictions.float())
+            else:
+                scores_t = torch.sigmoid(predictions)
+        else:
+            # 已是 [0,1] 概率
+            scores_t = predictions
 
-        pred_i = (pred_i > 0).float().numpy()
-        label_i = label_i.float().numpy()
+        # 2) 阈值化（用于 P/R/F1）
+        # 统一在“概率空间”施加阈值：当 logits 输入时，scores_t 已经是 sigmoid(logits)
+        # 若你想严格使用 logits>0 的判定，可将 threshold 固定为 0.5（两者等价）
+        y_pred_t = (scores_t >= threshold).to(torch.int32)
 
-        tp = (pred_i * label_i).sum()
-        precision = tp / (pred_i.sum() + 1e-8)
-        recall = tp / (label_i.sum() + 1e-8)
-        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    # 转 numpy
+    scores = scores_t.cpu().numpy()                  # 连续分数
+    y_pred = y_pred_t.cpu().numpy().astype(np.int32) # 二值预测
+    y_true = labels.cpu().numpy().astype(np.int32)   # 真实标签
 
+    # 3) 宏平均 Precision/Recall/F1（阈值后的 0/1）
+    p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0
+    )
+
+    # 4) per-class Precision/Recall/F1
+    p, r, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0
+    )
+
+    # 5) per-class AUC / PR-AUC（连续分数；单一类别 -> NaN）
+    aucs, praucs = [], []
+    for c in range(C):
+        yt, ys = y_true[:, c], scores[:, c]
+        if yt.max() == yt.min():
+            aucs.append(np.nan)
+            praucs.append(np.nan)
+        else:
+            aucs.append(roc_auc_score(yt, ys))
+            prec_curve, rec_curve, _ = precision_recall_curve(yt, ys)
+            praucs.append(auc(rec_curve, prec_curve))
+
+    # 6) 百分比格式化
+    def pct_scalar(x):
+        if x is None:
+            return None
         try:
-            auc_score = roc_auc_score(label_i, pred_i)
-        except ValueError:
-            auc_score = np.nan  # skip if only one class present
+            return None if np.isnan(x) else round(float(x) * 100.0, 4)
+        except TypeError:
+            return round(float(x) * 100.0, 4)
 
-        prec_curve, rec_curve, _ = precision_recall_curve(label_i, pred_i)
-        pr_auc_score = auc(rec_curve, prec_curve)
+    def pct_array(arr):
+        out = []
+        for v in arr:
+            if isinstance(v, float) and np.isnan(v):
+                out.append(None)
+            else:
+                out.append(round(float(v) * 100.0, 4))
+        return out
 
-        precisions.append(precision)
-        recalls.append(recall)
-        f1s.append(f1)
-        aucs.append(auc_score)
-        praucs.append(pr_auc_score)
-    
-    metrics = {
-        "precision": np.nanmean(precisions),
-        "recall": np.nanmean(recalls),
-        "f1": np.nanmean(f1s),
-        "auc": np.nanmean(aucs),
-        "prauc": np.nanmean(praucs),
+    global_metrics = {
+        "precision": pct_scalar(p_macro),
+        "recall":    pct_scalar(r_macro),
+        "f1":        pct_scalar(f1_macro),
+        "auc":       pct_scalar(np.nanmean(aucs)) if np.any(~np.isnan(aucs)) else None,
+        "prauc":     pct_scalar(np.nanmean(praucs)) if np.any(~np.isnan(praucs)) else None,
     }
-    
-    for m, v in metrics.items():
-        metrics[m] = round(v * 100, 4)
 
-    return metrics
+    assert len(PHENO_ORDER) == C, "len(PHENO_ORDER) must equal C"
+
+    per_class_df = pd.DataFrame({
+        "precision": pct_array(p),
+        "recall":    pct_array(r),
+        "f1":        pct_array(f1),
+        "auc":       pct_array(aucs),
+        "prauc":     pct_array(praucs),
+    }, index=PHENO_ORDER)
+
+    return global_metrics, per_class_df
 
 
 def run_binary_metrics(predictions, labels):
@@ -286,11 +370,13 @@ def evaluate(model, dataloader, device, task_type, long_seq_idx=None):
         else:
             return results
     else:
-        results = run_multilabel_metrics(predictions, labels)
+        results, per_class_df = run_multilabel_metrics(predictions, labels)
+        print(per_class_df)
         if long_seq_idx is not None:
-            long_seq_results = run_multilabel_metrics(
+            long_seq_results, long_seq_per_class_df = run_multilabel_metrics(
                 _select_long_seq(predictions), _select_long_seq(labels)
             )
+            print(long_seq_per_class_df)
             return results, long_seq_results
         else:
             return results

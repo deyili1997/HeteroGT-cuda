@@ -10,19 +10,16 @@ class DiseaseOccHetGNN(nn.Module):
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
 
-        # —— 规范化：按节点类型各自一套 LN —— #
         self.ln_v1 = nn.LayerNorm(d_model)
         self.ln_o1 = nn.LayerNorm(d_model)
         self.ln_v2 = nn.LayerNorm(d_model)
         self.ln_o2 = nn.LayerNorm(d_model)
 
-        # —— 可学习缩放（残差权重），初始化小值避免早期干扰 —— #
         self.alpha_v1 = nn.Parameter(torch.tensor(0.1))
         self.alpha_o1 = nn.Parameter(torch.tensor(0.1))
         self.alpha_v2 = nn.Parameter(torch.tensor(0.1))
         self.alpha_o2 = nn.Parameter(torch.tensor(0.1))
 
-        # 注意：这里用 aggr='sum'，让关系信号不被平均稀释
         self.conv1 = HeteroConv({
             ('visit','contains','occ'):   GATConv(d_model, d_model, heads=heads, concat=False, add_self_loops=False),
             ('occ','contained_by','visit'): GATConv(d_model, d_model, heads=heads, concat=False, add_self_loops=False),
@@ -35,34 +32,27 @@ class DiseaseOccHetGNN(nn.Module):
             ('visit','next','visit'):     GATConv(d_model, d_model, heads=heads, concat=False, add_self_loops=True),
         }, aggr='sum')
 
-        # 末端线性 + 残差（用零初始化保持“近似恒等”）
         self.lin_v = nn.Linear(d_model, d_model)
         self.lin_o = nn.Linear(d_model, d_model)
         nn.init.zeros_(self.lin_v.weight); nn.init.zeros_(self.lin_v.bias)
         nn.init.zeros_(self.lin_o.weight); nn.init.zeros_(self.lin_o.bias)
 
     def forward(self, hg):
-        # x_dict: {'visit': [N_visit, d], 'occ': [N_occ, d]}
         x_v = hg['visit'].x
         x_o = hg['occ'].x
 
-        # ===== Layer 1: 图卷积（sum 聚合）→ 残差 + LN =====
         h1 = self.conv1({'visit': x_v, 'occ': x_o}, hg.edge_index_dict)
-        # 残差注入前先丢弃避免过拟合
         dv = self.drop(h1['visit'])
         do = self.drop(h1['occ'])
-        # y = LN(x + α * Δx)
         v1 = self.ln_v1(x_v + self.alpha_v1 * dv)
         o1 = self.ln_o1(x_o + self.alpha_o1 * do)
 
-        # ===== Layer 2: 再一层图卷积 → 残差 + LN =====
         h2 = self.conv2({'visit': v1, 'occ': o1}, hg.edge_index_dict)
         dv2 = self.drop(h2['visit'])
         do2 = self.drop(h2['occ'])
         v2 = self.ln_v2(v1 + self.alpha_v2 * dv2)
         o2 = self.ln_o2(o1 + self.alpha_o2 * do2)
 
-        # ===== 末端线性：零初始化，等价“细调残差”，不改变整体尺度期望 =====
         v_out = v2 + self.lin_v(v2)
         o_out = o2 + self.lin_o(o2)
 

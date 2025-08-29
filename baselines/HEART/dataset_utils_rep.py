@@ -205,12 +205,13 @@ class HBERTFinetuneEHRDataset(Dataset):
                         else:
                             labels[hadm_id] = [row["DEATH"], row["STAY_DAYS"]]
                     else:  # next diagnosis prediction
-                        label = row["NEXT_DIAG_6M"] if task == "next_diag_6m" else row["NEXT_DIAG_12M"]
-                        if str(label) != "nan":  # only include the admission with next diagnosis
+                        flag = row["NEXT_DIAG_6M"] if task == "next_diag_6m" else row["NEXT_DIAG_12M"]
+                        if str(flag) != "nan":  # only include the admission with next diagnosis
                             # in other words, only admissions with future diagnosis labels are retained.
                             hadm_records[hadm_id] = list(patient)
                             age_records[hadm_id] = ages
                             genders[hadm_id] = [item_df.head(1)["GENDER"].values[0]]
+                            label = row["NEXT_DIAG_6M_PHENO"] if task == "next_diag_6m" else row["NEXT_DIAG_12M_PHENO"]
                             labels[hadm_id] = list(label)
 
             return hadm_records, age_records, genders, labels
@@ -260,10 +261,7 @@ class HBERTFinetuneEHRDataset(Dataset):
             # unlike pretrain dataset, where each code type has its own [MASK] token.
             input_tokens[-1] = [input_tokens[-1][0]] + ["[MASK0]"] + input_tokens[-1][1:]
             token_types[-1] = [token_types[-1][0]] + [1] + token_types[-1][1:]
-            label_ids = torch.tensor(self.tokenizer.convert_tokens_to_ids(self.labels[hadm_id], 
-                                                                          voc_type='diag'))
-            labels = torch.zeros(self.tokenizer.token_number(voc_type='diag')).long()
-            labels[label_ids] = 1  # multi-hop vector
+            labels = torch.tensor(self.labels[hadm_id]).float()  # already a binary vector
 
         visit_positions = torch.tensor(list(range(len(input_tokens))))  # [0, 1, 2, ...]
         input_tokens = [torch.tensor([self.tokenizer.convert_tokens_to_ids(x)]) for x in input_tokens]
