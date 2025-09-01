@@ -40,25 +40,29 @@ class FineTuneEHRDataset(Dataset):
                     patient.append(admission)
                     age.append(row['AGE'])
                     
-                    if task in ["death", "stay", "readmission"]:  # binary prediction
+                    if exp_flag == False:
                         hadm_records[hadm_id] = list(patient)
                         genders[hadm_id] = row["GENDER"]
                         ages[hadm_id] = list(age)
-                        labels[hadm_id] = [row["DEATH"], row["STAY_DAYS"], row["READMISSION"]] if exp_flag == True else None
+                        labels[hadm_id] = None
                         exp_flags[hadm_id] = exp_flag
-                    else: # next diagnosis prediction
-                        flag = row["NEXT_DIAG_6M"] if task == "next_diag_6m" else row["NEXT_DIAG_12M"]
-                        if str(flag) != "nan":  # only include the admission with next diagnosis
-                            # in other words, only admissions with future diagnosis labels are retained.
+                    else:
+                        if task in ["death", "stay", "readmission"]:  # binary prediction
                             hadm_records[hadm_id] = list(patient)
                             genders[hadm_id] = row["GENDER"]
                             ages[hadm_id] = list(age)
-                            if exp_flag == True:
+                            labels[hadm_id] = [row["DEATH"], row["STAY_DAYS"], row["READMISSION"]]
+                            exp_flags[hadm_id] = exp_flag
+                        else: # next diagnosis prediction
+                            flag = row["NEXT_DIAG_6M"] if task == "next_diag_6m" else row["NEXT_DIAG_12M"]
+                            if str(flag) != "nan":  # only include the admission with next diagnosis
+                                # in other words, only admissions with future diagnosis labels are retained.
+                                hadm_records[hadm_id] = list(patient)
+                                genders[hadm_id] = row["GENDER"]
+                                ages[hadm_id] = list(age)
                                 label = row["NEXT_DIAG_6M_PHENO"] if task == "next_diag_6m" else row["NEXT_DIAG_12M_PHENO"]
                                 labels[hadm_id] = list(label)
-                            else:
-                                labels[hadm_id] = None
-                            exp_flags[hadm_id] = exp_flag
+                                exp_flags[hadm_id] = exp_flag
             return hadm_records, genders, ages, labels, exp_flags
         self.records, self.genders, self.ages, self.labels, self.exp_flags = transform_data(ehr_finetune_data, task)
 
@@ -245,62 +249,6 @@ def norm_contruction(data, option='all_one'):
 
     return data
 
-# # batch_SetGNN should directly return a processed PyG data object, can be directly intake by SetGNN
-# def batcher_SetGNN_finetune(device):
-#     def batcher_dev(batch):
-#         raw_input_tokens, labels, exp_flags = [feat[0] for feat in batch], [feat[1] for feat in batch], [feat[2] for feat in batch]
-#         flat_visits = []
-#         last_visit_indices = []
-        
-#         # 1) 提取出非 None 部分
-#         labels_np = np.array(labels, dtype=object)  # 保留 None
-#         mask_np = np.array(exp_flags, dtype=bool)
-#         filtered_labels = labels_np[mask_np]
-
-#         # 2) 确认没有 None
-#         assert all(x is not None for x in filtered_labels)
-        
-#         for i in range(len(raw_input_tokens)):
-#             start_idx = len(flat_visits)
-#             flat_visits.extend(raw_input_tokens[i]) # here we flatten samples in a batch
-#             last_visit_indices.append(start_idx + len(raw_input_tokens[i]) - 1)
-            
-#         # Collect all unique node ids in this batch
-#         all_nodes = set()
-#         for visit in flat_visits:
-#             all_nodes.update(visit)
-#         global_node_ids = sorted(list(all_nodes))  # ensure consistent order
-        
-#         # build a mapping: global_id -> local_id
-#         node_id_map = {nid: i for i, nid in enumerate(global_node_ids)}
-        
-#         # remap visits to local node ids
-#         def remap(visits):
-#             return [[node_id_map[nid] for nid in visit] for visit in visits]
-#         flat_visits = remap(flat_visits)
-        
-#         # stack batch labels
-#         labels = torch.cat([t.view(-1) for t in filtered_labels.tolist()]).float()
-        
-#         # construct the Data object
-#         edge_list = []
-#         num_nodes = len(all_nodes)
-#         # convert flat_visits to a PyG Data object, we construct it as a bipartile graph to represent HG
-#         for h_id, visit in enumerate(flat_visits):
-#             for token in visit:
-#                 edge_list.append([token, num_nodes + h_id])  # 节点id, 超边id
-#                 edge_list.append([num_nodes + h_id, token])
-                
-#         edge_index = torch.tensor(edge_list).T.contiguous()  # shape (2, num_edges)
-        
-#         data = Data(edge_index=edge_index)
-#         data.n_x = torch.tensor([num_nodes])
-#         data.num_hyperedges = torch.tensor([len(flat_visits)])  # number of visits
-#         data = ExtractV2E(data)
-#         data = Add_Self_Loops(data)
-#         data = norm_contruction(data)
-#         return data, torch.tensor(global_node_ids, dtype=torch.long), torch.tensor(last_visit_indices, dtype=torch.long), torch.tensor(exp_flags, dtype=torch.bool), labels
-#     return batcher_dev
 
 def batcher_SetGNN_finetune(device):
     def batcher_dev(batch):
@@ -364,7 +312,10 @@ def batcher_SetGNN_finetune(device):
         edge_index = torch.tensor(edge_list, dtype=torch.long).T.contiguous() if edge_list else torch.empty((2, 0), dtype=torch.long)
         
         # 处理标签
-        labels = torch.cat([t.view(-1) for t in filtered_labels.tolist()]).float() if len(filtered_labels) > 0 else torch.empty(0, dtype=torch.float)
+        if len(filtered_labels[0]) > 1:
+            labels = torch.tensor(np.array(filtered_labels.tolist(), dtype=np.float32)).float()
+        else:
+            labels = torch.cat([t.view(-1) for t in filtered_labels.tolist()]).float() if len(filtered_labels) > 0 else torch.empty(0, dtype=torch.float)
         
         # 构建数据对象
         data = Data(edge_index=edge_index)
