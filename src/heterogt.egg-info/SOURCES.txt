@@ -5,7 +5,10 @@ src/heterogt.egg-info/SOURCES.txt
 src/heterogt.egg-info/dependency_links.txt
 src/heterogt.egg-info/requires.txt
 src/heterogt.egg-info/top_level.txt
+src/heterogt/model/__init__.py
+src/heterogt/model/laye_vis.py
 src/heterogt/model/layer.py
+src/heterogt/model/mode_vis.py
 src/heterogt/model/model.py
 src/heterogt/utils/__init__.py
 src/heterogt/utils/dataset.py
