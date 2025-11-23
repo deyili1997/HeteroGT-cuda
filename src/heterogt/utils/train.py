@@ -228,6 +228,30 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
 
     return best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, best_model_state, epochs_no_improve, early_stop_triggered
 
+def run_binary_metrics(predictions, labels):
+    predictions = predictions.view(-1)
+    labels = labels.view(-1).float()
+    scores = predictions.numpy()
+    binary_preds = (predictions > 0).float().numpy()  # logit > 0 ≈ prob > 0.5
+
+    tp = (binary_preds * labels.numpy()).sum()
+    precision = tp / (binary_preds.sum() + 1e-8)
+    recall = tp / (labels.sum().item() + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    rocauc = roc_auc_score(labels.numpy(), scores)
+    prec_curve, rec_curve, _ = precision_recall_curve(labels.numpy(), scores)
+    prauc = auc(rec_curve, prec_curve)
+    metrics = {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "auc": rocauc,
+        "prauc": prauc,
+    }
+    for m, v in metrics.items():
+        metrics[m] = round(v * 100, 4)
+    return metrics
+
 def run_multilabel_metrics(
     predictions: torch.Tensor,
     labels: torch.Tensor,
@@ -322,30 +346,6 @@ def run_multilabel_metrics(
 
     return global_metrics, per_class_df
 
-
-def run_binary_metrics(predictions, labels):
-    predictions = predictions.view(-1)
-    labels = labels.view(-1).float()
-    scores = predictions.numpy()
-    binary_preds = (predictions > 0).float().numpy()  # logit > 0 ≈ prob > 0.5
-
-    tp = (binary_preds * labels.numpy()).sum()
-    precision = tp / (binary_preds.sum() + 1e-8)
-    recall = tp / (labels.sum().item() + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
-    rocauc = roc_auc_score(labels.numpy(), scores)
-    prec_curve, rec_curve, _ = precision_recall_curve(labels.numpy(), scores)
-    prauc = auc(rec_curve, prec_curve)
-    metrics = {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "auc": rocauc,
-        "prauc": prauc,
-    }
-    for m, v in metrics.items():
-        metrics[m] = round(v * 100, 4)
-    return metrics
 
 @torch.no_grad()
 def evaluate(model, dataloader, device, task_type, long_seq_idx=None):
