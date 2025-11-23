@@ -371,7 +371,7 @@ def evaluate(model, dataloader, device, task_type, long_seq_idx=None):
             return results, long_seq_results
         else:
             return results
-    else:
+    else: # multi-label classification
         results, per_class_df = run_multilabel_metrics(predictions, labels)
         if long_seq_idx is not None:
             long_seq_results, long_seq_per_class_df = run_multilabel_metrics(
