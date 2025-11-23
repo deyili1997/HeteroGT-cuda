@@ -30,7 +30,8 @@ PHENO_ORDER = [
 
 def train_with_early_stopping(model, train_dataloader, val_dataloader, test_dataloader,
                               optimizer, loss_fn, device, early_stop_patience, task_type, epochs, dec_loss_lambda = 0, 
-                              val_long_seq_idx=None, test_long_seq_idx=None, eval_metric="prauc", return_model=False):
+                              val_long_seq_idx=None, test_long_seq_idx=None, eval_metric="prauc", return_model=False, 
+                              val_subgroup_labels=None, test_subgroup_labels=None):
 
     """
     main function to train the model and excute early stop
@@ -51,7 +52,8 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
         test_long_seq_idx (list, optional): indices for long sequences in test set. Defaults to None.
         eval_metric (str, optional): evaluation metric to use. Defaults to "prauc".
         return_model (bool, optional): whether to return the trained model. Defaults to False.
-
+        val_subgroup_labels (pandas.DataFrame, optional): subgroup labels for validation set. Defaults to None.
+        test_subgroup_labels (pandas.DataFrame, optional): subgroup labels for test set. Defaults to None.
     Returns:
         best test metrics and optionally the trained model
     """
@@ -65,6 +67,7 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
     best_val_metric = None
     best_test_metric = None
     best_test_long_seq_metric = None
+    best_subgroup_metrics = None
     best_model_state = deepcopy(model.state_dict())
     epochs_no_improve = 0
 
@@ -134,13 +137,35 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
             except Exception:
                 pass
 
-        # 在每个epoch后验证 + 早停
-        (best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, best_model_state,
-         epochs_no_improve, early_stop_triggered) = evaluate_and_early_stop(
-            model, val_dataloader, test_dataloader, device, task_type,
-            val_long_seq_idx, test_long_seq_idx, eval_metric,
-            best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, 
-            best_model_state, epochs_no_improve, early_stop_patience
+        # 在每个 epoch 结束后进行验证与早停检查
+        (
+            best_score,
+            best_val_metric,
+            best_test_metric,
+            best_test_long_seq_metric,
+            best_subgroup_metrics,
+            best_model_state,
+            epochs_no_improve,
+            early_stop_triggered,
+        ) = evaluate_and_early_stop(
+            model=model,
+            val_dataloader=val_dataloader,
+            test_dataloader=test_dataloader,
+            device=device,
+            task_type=task_type,
+            val_long_seq_idx=val_long_seq_idx,
+            test_long_seq_idx=test_long_seq_idx,
+            eval_metric=eval_metric,
+            best_score=best_score,
+            best_val_metric=best_val_metric,
+            best_test_metric=best_test_metric,
+            best_test_long_seq_metric=best_test_long_seq_metric,
+            best_subgroup_metrics=best_subgroup_metrics,
+            best_model_state=best_model_state,
+            epochs_no_improve=epochs_no_improve,
+            early_stop_patience=early_stop_patience,
+            val_subgroup_labels=val_subgroup_labels,
+            test_subgroup_labels=test_subgroup_labels,
         )
         if early_stop_triggered:
             break
@@ -155,15 +180,16 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
 
     model.load_state_dict(best_model_state)
     if return_model:
-        return (best_test_metric, best_test_long_seq_metric, model)
+        return (best_test_metric, best_test_long_seq_metric, best_subgroup_metrics, model)
     else:
-        return best_test_metric, best_test_long_seq_metric
+        return best_test_metric, best_test_long_seq_metric, best_subgroup_metrics
 
 
 def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task_type,
                                   val_long_seq_idx, test_long_seq_idx, eval_metric,
-                                  best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, 
-                                  best_model_state, epochs_no_improve, early_stop_patience):
+                                  best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, best_subgroup_metrics, 
+                                  best_model_state, epochs_no_improve, early_stop_patience, 
+                                  val_subgroup_labels, test_subgroup_labels):
     """
     执行模型在验证集和测试集的评估，并进行早停检查。
     返回：
@@ -175,17 +201,10 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
         - early_stop_triggered (bool)
     """
     # --- Evaluation ---
-    if val_long_seq_idx is not None:
-        val_metric, val_long_seq_metric = evaluate(model, val_dataloader, device, task_type, val_long_seq_idx)
-    else:
-        val_metric = evaluate(model, val_dataloader, device, task_type)
-        val_long_seq_metric = None
-
-    if test_long_seq_idx is not None:
-        test_metric, test_long_seq_metric = evaluate(model, test_dataloader, device, task_type, test_long_seq_idx)
-    else:
-        test_metric = evaluate(model, test_dataloader, device, task_type)
-        test_long_seq_metric = None
+    val_all_results = evaluate(model, val_dataloader, device, task_type, val_long_seq_idx, val_subgroup_labels)
+    val_metric, val_long_seq_metric, val_subgroup_metrics = val_all_results["overall"], val_all_results["long_seq"], val_all_results["subgroups"]
+    test_all_results = evaluate(model, test_dataloader, device, task_type, test_long_seq_idx, test_subgroup_labels)
+    test_metric, test_long_seq_metric, test_subgroup_metrics = test_all_results["overall"], test_all_results["long_seq"], test_all_results["subgroups"]
         
     if task_type != "binary":
         per_class_val_df = val_metric["per_class"]
@@ -204,6 +223,10 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
 
     print(f"Validation: {val_metric}")
     print(f"Test:      {test_metric}\n")
+    if val_subgroup_metrics is not None:
+        print(f"Validation-subgroups: {val_subgroup_metrics}")
+    if test_subgroup_metrics is not None:
+        print(f"Test-subgroups: {test_subgroup_metrics}")
     if val_long_seq_metric is not None:
         print(f"Validation-long: {val_long_seq_metric}")
     if test_long_seq_metric is not None:
@@ -218,6 +241,7 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
         best_val_metric = val_metric if task_type == "binary" else {"global": val_metric, "per_class": per_class_val_df}
         best_test_metric = test_metric if task_type == "binary" else {"global": test_metric, "per_class": per_class_test_df}
         best_test_long_seq_metric = test_long_seq_metric if task_type == "binary" else {"global": test_long_seq_metric, "per_class": per_class_test_long_seq_df}
+        best_subgroup_metrics = test_subgroup_metrics if task_type == "binary" else None
         best_model_state = deepcopy(model.state_dict())
         epochs_no_improve = 0
     else:
@@ -226,7 +250,7 @@ def evaluate_and_early_stop(model, val_dataloader, test_dataloader, device, task
             print(f"\nEarly stopping triggered (no improvement for {early_stop_patience} epochs).")
             early_stop_triggered = True
 
-    return best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, best_model_state, epochs_no_improve, early_stop_triggered
+    return best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, best_subgroup_metrics, best_model_state, epochs_no_improve, early_stop_triggered
 
 def run_binary_metrics(predictions, labels):
     predictions = predictions.view(-1)
@@ -348,10 +372,29 @@ def run_multilabel_metrics(
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, task_type, long_seq_idx=None):
+def evaluate(model, dataloader, device, task_type, long_seq_idx, subgroup_labels):
+    """
+    subgroup_labels: pandas.DataFrame, shape = (N, K)
+        N = dataloader 中样本总数，K = 疾病个数（你上面的 7/8 个病）
+        值为 0/1（二元），1 表示属于该 subgroup。
+    返回：
+        - 若未提供 subgroup_labels：保持与你原来逻辑兼容
+        - 若提供 subgroup_labels：
+            binary:
+                long_seq_idx is None:
+                    {"overall": overall_results,
+                     "subgroups": {col: metrics_dict, ...}}
+                long_seq_idx is not None:
+                    {"overall": overall_results,
+                     "long_seq": long_seq_results,
+                     "subgroups": {col: metrics_dict, ...}}
+            multi-label:
+                结构同上，只是 overall/long_seq 内部是 {"global": ..., "per_class": df}
+    """
+
     model.eval()
 
-    # 仅在 CUDA 上启用 autocast，避免 CPU/MPS 警告
+    # 仅在 CUDA 上启用 autocast
     device_type = device.type  # 'cuda' | 'cpu' | 'mps'
     use_amp = (device_type == "cuda")
     amp_ctx = autocast() if use_amp else nullcontext()
@@ -385,21 +428,81 @@ def evaluate(model, dataloader, device, task_type, long_seq_idx=None):
             idx = torch.as_tensor(long_seq_idx, dtype=torch.long)
         return t[idx]
 
+    # ====== 辅助函数：计算各 subgroup 的 metrics（总体人群上） ======
+    def _compute_subgroup_metrics(preds, lbls, subgroup_df, task_type):
+        """
+        preds: (N, ...) tensor on CPU
+        lbls:  (N, ...) tensor on CPU
+        subgroup_df: pandas.DataFrame, shape = (N, K), 0/1
+        返回: dict[col_name] = metrics 结构
+        """
+        if subgroup_df is None:
+            return None
+
+        if isinstance(subgroup_df, pd.Series):
+            subgroup_df = subgroup_df.to_frame()
+
+        assert len(subgroup_df) == preds.shape[0], \
+            f"subgroup_labels 行数 {len(subgroup_df)} 与样本数 {preds.shape[0]} 不一致"
+
+        results = {}
+        for col in subgroup_df.columns:
+            mask_np = subgroup_df[col].values.astype(bool)
+            if mask_np.sum() == 0:
+                # 该 subgroup 没有样本，可以选择跳过或返回 None
+                continue
+
+            mask = torch.as_tensor(mask_np, dtype=torch.bool)
+            sub_preds = preds[mask]
+            sub_lbls = lbls[mask]
+
+            if task_type == "binary":
+                sub_res = run_binary_metrics(sub_preds, sub_lbls)
+            else:  # multi-label
+                sub_global, sub_per_class = run_multilabel_metrics(sub_preds, sub_lbls)
+                sub_res = {"global": sub_global, "per_class": sub_per_class}
+
+            results[col] = sub_res
+
+        return results
+
+    # ====== 总体 metrics ======
     if task_type == "binary":
-        results = run_binary_metrics(predictions, labels)
+        overall_results = run_binary_metrics(predictions, labels)
+
+        if subgroup_labels is None:
+            subgroup_results = None
+        else:
+            # overall 上的 subgroup metrics
+            subgroup_results = _compute_subgroup_metrics(predictions, labels, subgroup_labels, task_type)
+
         if long_seq_idx is not None:
             long_seq_results = run_binary_metrics(
                 _select_long_seq(predictions), _select_long_seq(labels)
             )
-            return results, long_seq_results
+        
         else:
-            return results
-    else: # multi-label classification
-        results, per_class_df = run_multilabel_metrics(predictions, labels)
+            long_seq_results = None
+        # 组织返回结构
+        return {
+            "overall": overall_results,
+            "long_seq": long_seq_results,
+            "subgroups": subgroup_results
+        }
+
+    else:  # multi-label classification —— 不做 subgroup 分析
+        overall_global, overall_per_class = run_multilabel_metrics(predictions, labels)
+        overall = {"global": overall_global, "per_class": overall_per_class}
+
         if long_seq_idx is not None:
-            long_seq_results, long_seq_per_class_df = run_multilabel_metrics(
+            long_seq_global, long_seq_per_class = run_multilabel_metrics(
                 _select_long_seq(predictions), _select_long_seq(labels)
             )
-            return {"global": results, "per_class": per_class_df}, {"global": long_seq_results, "per_class": long_seq_per_class_df}
+            long_seq = {"global": long_seq_global, "per_class": long_seq_per_class}
         else:
-            return {"global": results, "per_class": per_class_df}
+            long_seq = None
+        return {
+            "overall": overall,
+            "long_seq": long_seq,
+            "subgroups": None
+        }
