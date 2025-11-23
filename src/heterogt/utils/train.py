@@ -32,6 +32,30 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
                               optimizer, loss_fn, device, early_stop_patience, task_type, epochs, dec_loss_lambda = 0, 
                               val_long_seq_idx=None, test_long_seq_idx=None, eval_metric="prauc", return_model=False):
 
+    """
+    main function to train the model and excute early stop
+
+    Args:
+        model: training model
+        train_dataloader (DataLoader): training data loader
+        val_dataloader (DataLoader): validation data loader
+        test_dataloader (DataLoader): test data loader
+        optimizer (Optimizer): optimizer for training
+        loss_fn (Callable): loss function
+        device (torch.device): device to run the training on
+        early_stop_patience (int): number of epochs to wait for improvement before stopping
+        task_type (str): type of task ("binary" or "l2r")
+        epochs (int): number of training epochs
+        dec_loss_lambda (int, optional): weight for the ancestor node decorrelation loss. Defaults to 0.
+        val_long_seq_idx (list, optional): indices for long sequences in validation set. Defaults to None.
+        test_long_seq_idx (list, optional): indices for long sequences in test set. Defaults to None.
+        eval_metric (str, optional): evaluation metric to use. Defaults to "prauc".
+        return_model (bool, optional): whether to return the trained model. Defaults to False.
+
+    Returns:
+        best test metrics and optionally the trained model
+    """
+
     # ---- 设备与AMP开关 ----
     device_type = device.type  # 'cuda' | 'cpu' | 'mps'
     use_amp = (device_type == "cuda")   # 仅在 CUDA 上启用 AMP/GradScaler，避免 CPU/MPS 警告
@@ -102,7 +126,6 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
                 else:
                     raise
 
-        epoch_loss = running_loss / max(1, (step + 1))
         if device_type == "cuda":
             torch.cuda.empty_cache()
         elif device_type == "mps":
@@ -111,7 +134,7 @@ def train_with_early_stopping(model, train_dataloader, val_dataloader, test_data
             except Exception:
                 pass
 
-        # 验证 + 早停
+        # 在每个epoch后验证 + 早停
         (best_score, best_val_metric, best_test_metric, best_test_long_seq_metric, best_model_state,
          epochs_no_improve, early_stop_triggered) = evaluate_and_early_stop(
             model, val_dataloader, test_dataloader, device, task_type,
